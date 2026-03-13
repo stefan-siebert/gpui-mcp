@@ -78,7 +78,15 @@ pub struct ClickEvent {
     pub element_id: Option<String>,
     pub x: f32,
     pub y: f32,
+    #[serde(default = "default_left_button")]
     pub button: MouseButton,
+    /// Optional window ID to target (falls back to active window, then first window)
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
+
+fn default_left_button() -> MouseButton {
+    MouseButton::Left
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,18 +96,32 @@ pub enum MouseButton {
     Middle,
 }
 
+impl Default for MouseButton {
+    fn default() -> Self {
+        MouseButton::Left
+    }
+}
+
 /// Keyboard Event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyEvent {
     pub key: String,
+    #[serde(default)]
     pub modifiers: Modifiers,
+    /// Optional window ID to target (falls back to active window, then first window)
+    #[serde(default)]
+    pub window_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Modifiers {
+    #[serde(default)]
     pub ctrl: bool,
+    #[serde(default)]
     pub alt: bool,
+    #[serde(default)]
     pub shift: bool,
+    #[serde(default)]
     pub meta: bool,
 }
 
@@ -110,15 +132,17 @@ pub mod methods {
     pub const GET_ELEMENT: &str = "get_element";
     pub const GET_WINDOWS: &str = "get_windows";
     pub const TAKE_SCREENSHOT: &str = "take_screenshot";
-    
+
     /// Automatisierung
     pub const CLICK_ELEMENT: &str = "click_element";
     pub const SEND_KEY: &str = "send_key";
     pub const EXECUTE_ACTION: &str = "execute_action";
-    
-    /// State
+
+    /// State & Debug
     pub const GET_APP_STATE: &str = "get_app_state";
     pub const GET_LOGS: &str = "get_logs";
+    pub const LIST_ACTIONS: &str = "list_actions";
+    pub const GET_FOCUS_INFO: &str = "get_focus_info";
 }
 
 /// Params für verschiedene Methods
@@ -129,12 +153,43 @@ pub struct GetElementParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TakeScreenshotParams {
+    #[serde(default)]
     pub highlight_elements: Vec<String>,
+    #[serde(default)]
     pub window_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteActionParams {
     pub action: String,
+    #[serde(default)]
     pub args: serde_json::Value,
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectUiTreeParams {
+    /// Maximum depth of the tree to return (0 = unlimited)
+    #[serde(default)]
+    pub max_depth: usize,
+    /// Only return elements from this window
+    #[serde(default)]
+    pub window_id: Option<String>,
+    /// Only return elements matching this type substring
+    #[serde(default)]
+    pub element_type_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListActionsParams {
+    /// Filter actions by name substring
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetFocusInfoParams {
+    #[serde(default)]
+    pub window_id: Option<String>,
 }

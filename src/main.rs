@@ -6,10 +6,10 @@ use std::os::unix::net::UnixStream;
 
 use gpui_mcp_protocol::protocol::*;
 
-/// MCP Server für GPUI Inspektion und Automatisierung
+/// MCP Server for GPUI inspection and automation.
 ///
-/// Kommuniziert über stdio mit Claude (MCP Protocol)
-/// Kommuniziert über Unix Socket mit der GPUI App
+/// Communicates over stdio with Claude (MCP Protocol)
+/// Communicates over Unix Socket with the GPUI App
 struct GpuiMcpServer {
     socket_path: String,
 }
@@ -19,13 +19,11 @@ impl GpuiMcpServer {
         Self { socket_path }
     }
 
-    /// Verbindet mit der GPUI App via Unix Socket
     fn connect(&self) -> Result<UnixStream> {
         UnixStream::connect(&self.socket_path)
-            .with_context(|| format!("Failed to connect to GPUI app at {}", self.socket_path))
+            .with_context(|| format!("GPUI app not running or not reachable at {}", self.socket_path))
     }
 
-    /// Sendet IPC Request an GPUI App und wartet auf Response
     fn send_ipc_request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let mut stream = self.connect()?;
 
@@ -35,13 +33,11 @@ impl GpuiMcpServer {
             params,
         };
 
-        // Request senden
         let request_json = serde_json::to_string(&request)?;
         stream.write_all(request_json.as_bytes())?;
         stream.write_all(b"\n")?;
         stream.flush()?;
 
-        // Response lesen (bis Newline)
         let mut response_buf = Vec::new();
         let mut byte = [0u8; 1];
         loop {
@@ -60,68 +56,41 @@ impl GpuiMcpServer {
         }
     }
 
-    /// Handlet ein MCP Tool Call
     fn handle_tool_call(&self, tool_name: &str, arguments: serde_json::Value) -> Result<serde_json::Value> {
         match tool_name {
             "inspect_ui_tree" => {
-                let result = self.send_ipc_request(methods::INSPECT_UI_TREE, json!({}))?;
-                let tree: UiTree = serde_json::from_value(result)?;
-                Ok(json!({
-                    "tree": tree,
-                    "summary": format!("UI tree with {} windows, root has {} children",
-                        tree.window_count, tree.root.children.len())
-                }))
+                self.send_ipc_request(methods::INSPECT_UI_TREE, arguments)
             }
-
             "get_element" => {
-                let params: GetElementParams = serde_json::from_value(arguments)?;
-                let result = self.send_ipc_request(methods::GET_ELEMENT, json!(params))?;
-                Ok(result)
+                self.send_ipc_request(methods::GET_ELEMENT, arguments)
             }
-
             "get_windows" => {
-                let result = self.send_ipc_request(methods::GET_WINDOWS, json!({}))?;
-                let windows: Vec<WindowInfo> = serde_json::from_value(result)?;
-                Ok(json!({
-                    "windows": windows,
-                    "count": windows.len()
-                }))
+                self.send_ipc_request(methods::GET_WINDOWS, json!({}))
             }
-
             "take_screenshot" => {
-                let params: TakeScreenshotParams = serde_json::from_value(arguments)?;
-                let result = self.send_ipc_request(methods::TAKE_SCREENSHOT, json!(params))?;
-                Ok(result)
+                self.send_ipc_request(methods::TAKE_SCREENSHOT, arguments)
             }
-
             "click_element" => {
-                let params: ClickEvent = serde_json::from_value(arguments)?;
-                let result = self.send_ipc_request(methods::CLICK_ELEMENT, json!(params))?;
-                Ok(result)
+                self.send_ipc_request(methods::CLICK_ELEMENT, arguments)
             }
-
             "send_key" => {
-                let params: KeyEvent = serde_json::from_value(arguments)?;
-                let result = self.send_ipc_request(methods::SEND_KEY, json!(params))?;
-                Ok(result)
+                self.send_ipc_request(methods::SEND_KEY, arguments)
             }
-
             "execute_action" => {
-                let params: ExecuteActionParams = serde_json::from_value(arguments)?;
-                let result = self.send_ipc_request(methods::EXECUTE_ACTION, json!(params))?;
-                Ok(result)
+                self.send_ipc_request(methods::EXECUTE_ACTION, arguments)
             }
-
             "get_app_state" => {
-                let result = self.send_ipc_request(methods::GET_APP_STATE, json!({}))?;
-                Ok(result)
+                self.send_ipc_request(methods::GET_APP_STATE, json!({}))
             }
-
             "get_logs" => {
-                let result = self.send_ipc_request(methods::GET_LOGS, json!({}))?;
-                Ok(result)
+                self.send_ipc_request(methods::GET_LOGS, json!({}))
             }
-
+            "list_actions" => {
+                self.send_ipc_request(methods::LIST_ACTIONS, arguments)
+            }
+            "get_focus_info" => {
+                self.send_ipc_request(methods::GET_FOCUS_INFO, arguments)
+            }
             _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
         }
     }
@@ -152,8 +121,197 @@ struct McpError {
     message: String,
 }
 
+fn send_response(stdout: &mut impl Write, response: &McpResponse) -> Result<()> {
+    let response_json = serde_json::to_string(response)?;
+    stdout.write_all(response_json.as_bytes())?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn tools_list() -> serde_json::Value {
+    json!({
+        "tools": [
+            {
+                "name": "get_windows",
+                "description": "List all open GPUI windows with their ID, title, bounds, and active status. Use this first to discover window IDs for other tools. Returns: [{id, title, bounds: {x,y,width,height}, is_active}]",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "inspect_ui_tree",
+                "description": "Get the UI element hierarchy for debugging layout and structure. Each element has: id, element_type (derived from source file), bounds, source_location, children. Use max_depth to limit tree size (default: unlimited). Use window_id to inspect a specific window. Use element_type_filter to find specific element types (e.g. 'button', 'input'). WARNING: Without filters this can return very large responses.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "max_depth": {
+                            "type": "integer",
+                            "description": "Maximum tree depth to return (0 or omit = unlimited). Use 2-3 for overview."
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Only inspect this window (from get_windows). Omit for all windows."
+                        },
+                        "element_type_filter": {
+                            "type": "string",
+                            "description": "Only return elements whose type contains this substring (case-insensitive)"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "get_element",
+                "description": "Get details about a specific UI element by ID (from inspect_ui_tree). Supports exact full_id match, global_id match, or suffix match. Returns the element with its children, bounds, source location, and properties.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "element_id": {
+                            "type": "string",
+                            "description": "Element ID to find. Can be full ID (WindowId(1)/view-1.panel[0]), global_id (view-1.panel), or suffix (panel)"
+                        }
+                    },
+                    "required": ["element_id"]
+                }
+            },
+            {
+                "name": "get_focus_info",
+                "description": "Get information about the currently focused element and active key contexts. Essential for debugging keyboard/focus issues. Returns: {has_focus, focus_id, window_id, key_contexts: [...]}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to check focus for (default: active window)"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "list_actions",
+                "description": "List all registered GPUI actions that can be dispatched via execute_action. Actions are the keyboard shortcuts and commands of the app (e.g. 'elane::CursorUp', 'elane::ToggleTerminal'). Use filter to search by name substring.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "filter": {
+                            "type": "string",
+                            "description": "Filter actions by name substring (case-insensitive). E.g. 'cursor', 'toggle'"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "execute_action",
+                "description": "Execute a named GPUI action on the focused element of a window. Actions are dispatched through the focus chain just like keyboard shortcuts. Use list_actions to find available action names. Example: {\"action\": \"elane::ToggleTerminal\"}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "Full action name (e.g. 'elane::CursorUp', 'elane::ActivateItem'). Use list_actions to discover names."
+                        },
+                        "args": {
+                            "type": "object",
+                            "description": "Optional JSON arguments for the action (most actions take none)"
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Target window (default: active window)"
+                        }
+                    },
+                    "required": ["action"]
+                }
+            },
+            {
+                "name": "send_key",
+                "description": "Send a keyboard keystroke to the app. The key is dispatched to the focused element. Use GPUI key format: lowercase key name with modifier prefixes. Examples: 'a', 'enter', 'escape', 'tab', 'f1', 'up', 'down'. Modifiers via the modifiers object.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "Key name: 'a'-'z', '0'-'9', 'enter', 'escape', 'tab', 'space', 'backspace', 'delete', 'up', 'down', 'left', 'right', 'home', 'end', 'pageup', 'pagedown', 'f1'-'f12', '+', '-', etc."
+                        },
+                        "modifiers": {
+                            "type": "object",
+                            "properties": {
+                                "ctrl": { "type": "boolean", "description": "Ctrl modifier" },
+                                "alt": { "type": "boolean", "description": "Alt modifier" },
+                                "shift": { "type": "boolean", "description": "Shift modifier" },
+                                "meta": { "type": "boolean", "description": "Super/Cmd modifier" }
+                            }
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Target window (default: active window)"
+                        }
+                    },
+                    "required": ["key"]
+                }
+            },
+            {
+                "name": "click_element",
+                "description": "Simulate a mouse click at specific pixel coordinates in a window. Coordinates are relative to the window's content area. Use inspect_ui_tree to find element bounds for targeting.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "number", "description": "X coordinate in pixels (from window left edge)" },
+                        "y": { "type": "number", "description": "Y coordinate in pixels (from window top edge)" },
+                        "button": {
+                            "type": "string",
+                            "enum": ["Left", "Right", "Middle"],
+                            "description": "Mouse button (default: Left)"
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Target window (default: active window)"
+                        }
+                    },
+                    "required": ["x", "y"]
+                }
+            },
+            {
+                "name": "take_screenshot",
+                "description": "Take a screenshot of a window. Returns base64-encoded PNG image data. Currently only supported on macOS (Metal renderer).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to screenshot (default: active window)"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "get_app_state",
+                "description": "Get a snapshot of the application state: window count, active window, and per-window bounds/titles. Quick overview without the full UI tree.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "get_logs",
+                "description": "Get recent MCP-related log entries (up to 500 buffered). Useful for debugging MCP interactions and seeing results of dispatched actions/keys.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        ]
+    })
+}
+
 fn main() -> Result<()> {
-    // Socket Path aus Environment oder Default
     let socket_path = std::env::var("GPUI_MCP_SOCKET")
         .unwrap_or_else(|_| "/tmp/gpui-mcp.sock".to_string());
 
@@ -168,6 +326,10 @@ fn main() -> Result<()> {
 
     for line in reader.lines() {
         let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
         let request: McpRequest = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(e) => {
@@ -178,222 +340,104 @@ fn main() -> Result<()> {
 
         let id = request.id.clone().unwrap_or(json!(null));
 
-        // Handle initialize
-        if request.method == "initialize" {
-            let response = McpResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "gpui-mcp-inspector",
-                        "version": "0.1.0"
-                    }
-                })),
-                error: None,
-            };
-
-            let response_json = serde_json::to_string(&response)?;
-            stdout.write_all(response_json.as_bytes())?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-            continue;
-        }
-
-        // Handle tools/list
-        if request.method == "tools/list" {
-            let response = McpResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(json!({
-                    "tools": [
-                        {
-                            "name": "inspect_ui_tree",
-                            "description": "Get complete UI element tree with hierarchy, bounds, and properties",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {},
-                                "required": []
-                            }
-                        },
-                        {
-                            "name": "get_element",
-                            "description": "Get detailed information about a specific UI element by ID",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "element_id": {
-                                        "type": "string",
-                                        "description": "The unique ID of the element to inspect"
-                                    }
-                                },
-                                "required": ["element_id"]
-                            }
-                        },
-                        {
-                            "name": "get_windows",
-                            "description": "Get list of all windows with their properties",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {},
-                                "required": []
-                            }
-                        },
-                        {
-                            "name": "take_screenshot",
-                            "description": "Take a screenshot of the app, optionally highlighting specific elements",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "highlight_elements": {
-                                        "type": "array",
-                                        "items": { "type": "string" },
-                                        "description": "Element IDs to highlight in the screenshot"
-                                    },
-                                    "window_id": {
-                                        "type": "string",
-                                        "description": "Optional window ID to screenshot"
-                                    }
-                                },
-                                "required": []
-                            }
-                        },
-                        {
-                            "name": "click_element",
-                            "description": "Simulate a mouse click on an element or coordinates",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "element_id": {
-                                        "type": "string",
-                                        "description": "Element ID to click (optional if x/y provided)"
-                                    },
-                                    "x": {
-                                        "type": "number",
-                                        "description": "X coordinate to click"
-                                    },
-                                    "y": {
-                                        "type": "number",
-                                        "description": "Y coordinate to click"
-                                    },
-                                    "button": {
-                                        "type": "string",
-                                        "enum": ["Left", "Right", "Middle"],
-                                        "description": "Mouse button to use"
-                                    }
-                                },
-                                "required": ["x", "y"]
-                            }
-                        },
-                        {
-                            "name": "send_key",
-                            "description": "Send keyboard input to the app",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "key": {
-                                        "type": "string",
-                                        "description": "Key to send (e.g. 'a', 'Enter', 'Escape')"
-                                    },
-                                    "modifiers": {
-                                        "type": "object",
-                                        "properties": {
-                                            "ctrl": { "type": "boolean" },
-                                            "alt": { "type": "boolean" },
-                                            "shift": { "type": "boolean" },
-                                            "meta": { "type": "boolean" }
-                                        }
-                                    }
-                                },
-                                "required": ["key"]
-                            }
-                        },
-                        {
-                            "name": "execute_action",
-                            "description": "Execute a named action/command in the app",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "action": {
-                                        "type": "string",
-                                        "description": "Action name to execute"
-                                    },
-                                    "args": {
-                                        "type": "object",
-                                        "description": "Arguments for the action"
-                                    }
-                                },
-                                "required": ["action"]
-                            }
-                        },
-                        {
-                            "name": "get_app_state",
-                            "description": "Get current application state snapshot",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {},
-                                "required": []
-                            }
-                        },
-                        {
-                            "name": "get_logs",
-                            "description": "Get recent application logs",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {},
-                                "required": []
-                            }
-                        }
-                    ]
-                })),
-                error: None,
-            };
-
-            let response_json = serde_json::to_string(&response)?;
-            stdout.write_all(response_json.as_bytes())?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-            continue;
-        }
-
-        // Handle tools/call
-        if request.method == "tools/call" {
-            let params = request.params.unwrap_or(json!({}));
-            let tool_name = params["name"].as_str().unwrap_or("");
-            let arguments = params["arguments"].clone();
-
-            let result = server.handle_tool_call(tool_name, arguments);
-
-            let response = match result {
-                Ok(content) => McpResponse {
+        match request.method.as_str() {
+            // MCP lifecycle
+            "initialize" => {
+                send_response(&mut stdout, &McpResponse {
                     jsonrpc: "2.0".to_string(),
                     id,
                     result: Some(json!({
-                        "content": [{
-                            "type": "text",
-                            "text": serde_json::to_string_pretty(&content)?
-                        }]
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "tools": {}
+                        },
+                        "serverInfo": {
+                            "name": "gpui-mcp-inspector",
+                            "version": "0.2.0"
+                        }
                     })),
                     error: None,
-                },
-                Err(e) => McpResponse {
+                })?;
+            }
+
+            // Client sends this after initialize — acknowledge silently
+            "notifications/initialized" => {
+                eprintln!("[MCP] Client initialized");
+                // Notifications don't get responses
+            }
+
+            // Health check
+            "ping" => {
+                send_response(&mut stdout, &McpResponse {
                     jsonrpc: "2.0".to_string(),
                     id,
-                    result: None,
-                    error: Some(McpError {
-                        code: -32000,
-                        message: e.to_string(),
-                    }),
-                },
-            };
+                    result: Some(json!({})),
+                    error: None,
+                })?;
+            }
 
-            let response_json = serde_json::to_string(&response)?;
-            stdout.write_all(response_json.as_bytes())?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
+            "tools/list" => {
+                send_response(&mut stdout, &McpResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id,
+                    result: Some(tools_list()),
+                    error: None,
+                })?;
+            }
+
+            "tools/call" => {
+                let params = request.params.unwrap_or(json!({}));
+                let tool_name = params["name"].as_str().unwrap_or("");
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+                let result = server.handle_tool_call(tool_name, arguments);
+
+                let response = match result {
+                    Ok(content) => McpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string_pretty(&content)?
+                            }]
+                        })),
+                        error: None,
+                    },
+                    Err(e) => McpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": format!("Error: {}", e)
+                            }],
+                            "isError": true
+                        })),
+                        error: None,
+                    },
+                };
+
+                send_response(&mut stdout, &response)?;
+            }
+
+            // Unknown methods — ignore notifications, error on requests
+            method => {
+                if method.starts_with("notifications/") {
+                    // Notifications don't need responses
+                    eprintln!("[MCP] Ignoring unknown notification: {}", method);
+                } else {
+                    send_response(&mut stdout, &McpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(McpError {
+                            code: -32601,
+                            message: format!("Method not found: {}", method),
+                        }),
+                    })?;
+                }
+            }
         }
     }
 
