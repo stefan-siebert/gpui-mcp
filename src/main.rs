@@ -68,7 +68,30 @@ impl GpuiMcpServer {
                 self.send_ipc_request(methods::GET_WINDOWS, json!({}))
             }
             "take_screenshot" => {
-                self.send_ipc_request(methods::TAKE_SCREENSHOT, arguments)
+                let result = self.send_ipc_request(methods::TAKE_SCREENSHOT, arguments)?;
+
+                // The IPC response contains a file path to the PNG screenshot.
+                // Read it, encode as base64, and clean up the temp file.
+                let path = result["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Screenshot response missing 'path'"))?;
+
+                let png_data = std::fs::read(path)
+                    .with_context(|| format!("Failed to read screenshot file: {}", path))?;
+
+                // Clean up temp file
+                let _ = std::fs::remove_file(path);
+
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+
+                Ok(json!({
+                    "width": result["width"],
+                    "height": result["height"],
+                    "format": "png",
+                    "data": b64,
+                    "encoding": "base64",
+                }))
             }
             "click_element" => {
                 self.send_ipc_request(methods::CLICK_ELEMENT, arguments)
@@ -277,7 +300,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "take_screenshot",
-                "description": "Take a screenshot of a window. Returns base64-encoded PNG image data. Currently only supported on macOS (Metal renderer).",
+                "description": "Take a screenshot of a window. Renders the current window content to a PNG image and returns it as base64-encoded image data. Works on all platforms (Linux/macOS/Windows).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -393,17 +416,47 @@ fn main() -> Result<()> {
                 let result = server.handle_tool_call(tool_name, arguments);
 
                 let response = match result {
-                    Ok(content) => McpResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id,
-                        result: Some(json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string_pretty(&content)?
-                            }]
-                        })),
-                        error: None,
-                    },
+                    Ok(content) => {
+                        // For screenshots, return as MCP image content
+                        let mcp_content = if tool_name == "take_screenshot" {
+                            if let (Some(data), Some(mime)) = (content["data"].as_str(), Some("image/png")) {
+                                json!({
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "data": data,
+                                            "mimeType": mime,
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": format!("Screenshot: {}x{}", content["width"], content["height"])
+                                        }
+                                    ]
+                                })
+                            } else {
+                                json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": serde_json::to_string_pretty(&content)?
+                                    }]
+                                })
+                            }
+                        } else {
+                            json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string_pretty(&content)?
+                                }]
+                            })
+                        };
+
+                        McpResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            result: Some(mcp_content),
+                            error: None,
+                        }
+                    }
                     Err(e) => McpResponse {
                         jsonrpc: "2.0".to_string(),
                         id,
