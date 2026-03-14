@@ -114,6 +114,9 @@ impl GpuiMcpServer {
             "get_focus_info" => {
                 self.send_ipc_request(methods::GET_FOCUS_INFO, arguments)
             }
+            "type_text" => {
+                self.send_ipc_request(methods::TYPE_TEXT, arguments)
+            }
             _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
         }
     }
@@ -166,7 +169,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "inspect_ui_tree",
-                "description": "Get the UI element hierarchy for debugging layout and structure. Each element has: id, element_type (derived from source file), bounds, source_location, children. Use max_depth to limit tree size (default: unlimited). Use window_id to inspect a specific window. Use element_type_filter to find specific element types (e.g. 'button', 'input'). WARNING: Without filters this can return very large responses.",
+                "description": "Get the UI element hierarchy for debugging layout and structure. Each element has: id, element_type (derived from source file), bounds, source_location, children, properties. Use max_depth to limit tree size (default: unlimited). Use root_element_id to inspect a subtree instead of the whole app. Use format='compact' to strip verbose fields (bounds, content_mask, source_location, content_size). WARNING: Without filters this can return very large responses.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -181,6 +184,15 @@ fn tools_list() -> serde_json::Value {
                         "element_type_filter": {
                             "type": "string",
                             "description": "Only return elements whose type contains this substring (case-insensitive)"
+                        },
+                        "root_element_id": {
+                            "type": "string",
+                            "description": "Start the tree at this element instead of the root. Supports full_id, global_id, or suffix match. Use to drill into a subtree without fetching the whole tree."
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["full", "compact"],
+                            "description": "Output format. 'compact' strips bounds, content_mask, source_location, content_size — keeps id, element_type, children, properties. Default: 'full'."
                         }
                     },
                     "required": []
@@ -216,13 +228,17 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "list_actions",
-                "description": "List all registered GPUI actions that can be dispatched via execute_action. Actions are the keyboard shortcuts and commands of the app (e.g. 'elane::CursorUp', 'elane::ToggleTerminal'). Use filter to search by name substring.",
+                "description": "List all registered GPUI actions that can be dispatched via execute_action. Actions are the keyboard shortcuts and commands of the app (e.g. 'elane::CursorUp', 'elane::ToggleTerminal'). Use filter to search by name substring. Set include_bindings=true to get keybinding and context info for each action.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "filter": {
                             "type": "string",
                             "description": "Filter actions by name substring (case-insensitive). E.g. 'cursor', 'toggle'"
+                        },
+                        "include_bindings": {
+                            "type": "boolean",
+                            "description": "If true, return keybinding, context, and documentation for each action instead of just names. Default: false."
                         }
                     },
                     "required": []
@@ -279,12 +295,16 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "click_element",
-                "description": "Simulate a mouse click at specific pixel coordinates in a window. Coordinates are relative to the window's content area. Use inspect_ui_tree to find element bounds for targeting.",
+                "description": "Simulate a mouse click. Provide EITHER element_id (clicks center of that element) OR x/y pixel coordinates. Element ID supports full_id, global_id, or suffix match.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "x": { "type": "number", "description": "X coordinate in pixels (from window left edge)" },
-                        "y": { "type": "number", "description": "Y coordinate in pixels (from window top edge)" },
+                        "element_id": {
+                            "type": "string",
+                            "description": "Click the center of this element. Supports full_id, global_id, or suffix match from inspect_ui_tree."
+                        },
+                        "x": { "type": "number", "description": "X coordinate in pixels (from window left edge). Used when element_id is not provided." },
+                        "y": { "type": "number", "description": "Y coordinate in pixels (from window top edge). Used when element_id is not provided." },
                         "button": {
                             "type": "string",
                             "enum": ["Left", "Right", "Middle"],
@@ -295,7 +315,25 @@ fn tools_list() -> serde_json::Value {
                             "description": "Target window (default: active window)"
                         }
                     },
-                    "required": ["x", "y"]
+                    "required": []
+                }
+            },
+            {
+                "name": "type_text",
+                "description": "Type a text string into the focused element by dispatching individual keystrokes. Much more convenient than send_key for entering text in input fields and dialogs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "The text to type"
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Target window (default: active window)"
+                        }
+                    },
+                    "required": ["text"]
                 }
             },
             {

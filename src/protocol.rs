@@ -35,6 +35,9 @@ pub struct UiElement {
     /// Content-Size des Elements (width, height)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_size: Option<(f32, f32)>,
+    /// Text content painted within this element's bounds
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_content: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,7 +79,9 @@ pub struct Screenshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClickEvent {
     pub element_id: Option<String>,
+    #[serde(default)]
     pub x: f32,
+    #[serde(default)]
     pub y: f32,
     #[serde(default = "default_left_button")]
     pub button: MouseButton,
@@ -89,17 +94,12 @@ fn default_left_button() -> MouseButton {
     MouseButton::Left
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum MouseButton {
+    #[default]
     Left,
     Right,
     Middle,
-}
-
-impl Default for MouseButton {
-    fn default() -> Self {
-        MouseButton::Left
-    }
 }
 
 /// Keyboard Event
@@ -137,6 +137,9 @@ pub mod methods {
     pub const CLICK_ELEMENT: &str = "click_element";
     pub const SEND_KEY: &str = "send_key";
     pub const EXECUTE_ACTION: &str = "execute_action";
+
+    /// Text input
+    pub const TYPE_TEXT: &str = "type_text";
 
     /// State & Debug
     pub const GET_APP_STATE: &str = "get_app_state";
@@ -179,6 +182,14 @@ pub struct InspectUiTreeParams {
     /// Only return elements matching this type substring
     #[serde(default)]
     pub element_type_filter: Option<String>,
+    /// Start the tree at this element ID instead of the root.
+    /// Supports full_id, global_id, or suffix match (same as get_element).
+    #[serde(default)]
+    pub root_element_id: Option<String>,
+    /// Output format: "full" (default) or "compact" (strips bounds, content_mask,
+    /// source_location, content_size, style_json — keeps id, element_type, children, properties).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +197,18 @@ pub struct ListActionsParams {
     /// Filter actions by name substring
     #[serde(default)]
     pub filter: Option<String>,
+    /// If true, include keybinding and context info for each action
+    #[serde(default)]
+    pub include_bindings: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeTextParams {
+    /// The text string to type into the focused element
+    pub text: String,
+    /// Optional window ID to target (falls back to active window)
+    #[serde(default)]
+    pub window_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
