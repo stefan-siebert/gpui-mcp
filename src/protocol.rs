@@ -194,6 +194,10 @@ pub struct InspectUiTreeParams {
     /// source_location, content_size, style_json — keeps id, element_type, children, properties).
     #[serde(default)]
     pub format: Option<String>,
+    /// Only return elements whose text_content contains this substring (case-insensitive).
+    /// Elements are kept if they match or have matching descendants.
+    #[serde(default)]
+    pub text_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

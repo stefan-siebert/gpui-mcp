@@ -193,6 +193,10 @@ fn tools_list() -> serde_json::Value {
                             "type": "string",
                             "enum": ["full", "compact"],
                             "description": "Output format. 'compact' strips bounds, content_mask, source_location, content_size — keeps id, element_type, children, properties. Default: 'full'."
+                        },
+                        "text_filter": {
+                            "type": "string",
+                            "description": "Only return elements whose text_content contains this substring (case-insensitive). Keeps matching elements and their ancestors."
                         }
                     },
                     "required": []
@@ -200,7 +204,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_element",
-                "description": "Get details about a specific UI element by ID (from inspect_ui_tree). Supports exact full_id match, global_id match, or suffix match. Returns the element with its children, bounds, source location, and properties.",
+                "description": "Get a UI element and its full subtree by ID. Supports exact full_id, global_id, or suffix match. Returns the element with all descendants, text content, bounds, source location, and properties.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
