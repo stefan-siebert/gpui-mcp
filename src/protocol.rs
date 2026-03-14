@@ -160,6 +160,10 @@ pub struct TakeScreenshotParams {
     pub highlight_elements: Vec<String>,
     #[serde(default)]
     pub window_id: Option<String>,
+    /// If set, crop the screenshot to this element's bounds.
+    /// Supports full_id, global_id, or suffix match.
+    #[serde(default)]
+    pub element_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

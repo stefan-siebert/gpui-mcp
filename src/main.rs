@@ -338,13 +338,17 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "take_screenshot",
-                "description": "Take a screenshot of a window. Renders the current window content to a PNG image and returns it as base64-encoded image data. Works on all platforms (Linux/macOS/Windows).",
+                "description": "Take a screenshot of a window or a specific element. Renders the current window content to a PNG image. Optionally crop to a specific element by ID for a focused, higher-detail view.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "window_id": {
                             "type": "string",
                             "description": "Window to screenshot (default: active window)"
+                        },
+                        "element_id": {
+                            "type": "string",
+                            "description": "Crop screenshot to this element's bounds. Supports full_id, global_id, or suffix match from inspect_ui_tree."
                         }
                     },
                     "required": []
