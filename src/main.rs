@@ -2,16 +2,90 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
+
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 use gpui_mcp_protocol::protocol::*;
 
 /// MCP Server for GPUI inspection and automation.
 ///
 /// Communicates over stdio with Claude (MCP Protocol)
-/// Communicates over Unix Socket with the GPUI App
+/// Communicates over Unix Domain Socket with the GPUI App
 struct GpuiMcpServer {
     socket_path: String,
+}
+
+/// Discover running GPUI MCP instances by scanning for socket files.
+/// Returns a list of socket paths sorted by most recent (newest first).
+fn discover_instances() -> Vec<String> {
+    let temp_dir = std::env::temp_dir();
+    let mut sockets = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("gpui-mcp-") && name_str.ends_with(".sock") {
+                let path = entry.path().to_string_lossy().into_owned();
+                // Check if the socket is actually connectable
+                let connectable = UnixStream::connect(&path).is_ok();
+                if connectable {
+                    sockets.push(path);
+                } else {
+                    // Stale socket — clean up
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    // Sort by modification time (newest first)
+    sockets.sort_by(|a, b| {
+        let time_a = std::fs::metadata(a).and_then(|m| m.modified()).ok();
+        let time_b = std::fs::metadata(b).and_then(|m| m.modified()).ok();
+        time_b.cmp(&time_a)
+    });
+
+    sockets
+}
+
+/// Resolve the socket path to connect to.
+/// Priority: GPUI_MCP_SOCKET env > GPUI_MCP_PID env > auto-discovery
+fn resolve_socket_path() -> Result<String> {
+    // Explicit socket path
+    if let Ok(path) = std::env::var("GPUI_MCP_SOCKET") {
+        return Ok(path);
+    }
+
+    // Explicit PID
+    if let Ok(pid) = std::env::var("GPUI_MCP_PID") {
+        let path = std::env::temp_dir()
+            .join(format!("gpui-mcp-{}.sock", pid))
+            .to_string_lossy()
+            .into_owned();
+        return Ok(path);
+    }
+
+    // Auto-discover
+    let instances = discover_instances();
+    match instances.len() {
+        0 => Err(anyhow::anyhow!(
+            "No running GPUI app found. Looked for gpui-mcp-*.sock in {}",
+            std::env::temp_dir().display()
+        )),
+        1 => Ok(instances.into_iter().next().unwrap()),
+        n => {
+            eprintln!(
+                "[MCP] Found {} GPUI instances, connecting to most recent. \
+                 Set GPUI_MCP_PID to target a specific one.",
+                n
+            );
+            Ok(instances.into_iter().next().unwrap())
+        }
+    }
 }
 
 impl GpuiMcpServer {
@@ -381,13 +455,11 @@ fn tools_list() -> serde_json::Value {
 }
 
 fn main() -> Result<()> {
-    let socket_path = std::env::var("GPUI_MCP_SOCKET")
-        .unwrap_or_else(|_| "/tmp/gpui-mcp.sock".to_string());
-
+    let socket_path = resolve_socket_path()?;
     let server = GpuiMcpServer::new(socket_path.clone());
 
     eprintln!("GPUI MCP Server starting...");
-    eprintln!("Waiting for GPUI app at: {}", socket_path);
+    eprintln!("Connected to GPUI app via: {}", socket_path);
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

@@ -1,8 +1,12 @@
 use crate::protocol::*;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
 use std::sync::{mpsc, Arc, Mutex};
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 /// Interface das die GPUI App implementieren muss.
 /// Damit der IPC Server Zugriff auf UI State hat.
@@ -41,7 +45,7 @@ impl IpcServer {
     }
 
     fn run(&self) -> anyhow::Result<()> {
-        // Alten Socket entfernen falls vorhanden
+        // Remove stale socket
         let _ = std::fs::remove_file(&self.socket_path);
 
         let listener = UnixListener::bind(&self.socket_path)?;
@@ -67,7 +71,7 @@ impl IpcServer {
     }
 
     fn handle_connection(
-        stream: std::os::unix::net::UnixStream,
+        stream: UnixStream,
         app: Arc<Mutex<Box<dyn AppInterface>>>,
     ) -> anyhow::Result<()> {
         let reader = BufReader::new(&stream);
@@ -167,10 +171,15 @@ impl IpcServer {
     }
 }
 
-/// Convenience: Startet den IPC Server mit Default-Socket-Path.
+/// Convenience: Startet den IPC Server mit Default-Socket-Pfad (PID-basiert).
 pub fn start_ipc_server(app: Box<dyn AppInterface>) -> std::thread::JoinHandle<()> {
-    let socket_path = std::env::var("GPUI_MCP_SOCKET")
-        .unwrap_or_else(|_| "/tmp/gpui-mcp.sock".to_string());
+    let socket_path = std::env::var("GPUI_MCP_SOCKET").unwrap_or_else(|_| {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir();
+        dir.join(format!("gpui-mcp-{}.sock", pid))
+            .to_string_lossy()
+            .into_owned()
+    });
 
     let server = IpcServer::new(socket_path, Arc::new(Mutex::new(app)));
     server.start()
@@ -217,6 +226,7 @@ impl ChannelIpcServer {
     }
 
     fn run(&self) -> anyhow::Result<()> {
+        // Remove stale socket
         let _ = std::fs::remove_file(&self.socket_path);
 
         let listener = UnixListener::bind(&self.socket_path)?;
@@ -242,7 +252,7 @@ impl ChannelIpcServer {
     }
 
     fn handle_connection(
-        stream: std::os::unix::net::UnixStream,
+        stream: UnixStream,
         sender: mpsc::Sender<(IpcRequest, mpsc::Sender<IpcResponse>)>,
     ) -> anyhow::Result<()> {
         let reader = BufReader::new(&stream);
