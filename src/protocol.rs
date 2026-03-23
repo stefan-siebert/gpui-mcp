@@ -35,9 +35,6 @@ pub struct UiElement {
     /// Content-Size des Elements (width, height)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_size: Option<(f32, f32)>,
-    /// Text content painted within this element's bounds
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub text_content: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,24 +76,14 @@ pub struct Screenshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClickEvent {
     pub element_id: Option<String>,
-    #[serde(default)]
-    pub x: f32,
-    #[serde(default)]
-    pub y: f32,
-    #[serde(default = "default_left_button")]
-    pub button: MouseButton,
-    /// Optional window ID to target (falls back to active window, then first window)
-    #[serde(default)]
     pub window_id: Option<String>,
+    pub x: f32,
+    pub y: f32,
+    pub button: MouseButton,
 }
 
-fn default_left_button() -> MouseButton {
-    MouseButton::Left
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MouseButton {
-    #[default]
     Left,
     Right,
     Middle,
@@ -106,22 +93,15 @@ pub enum MouseButton {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyEvent {
     pub key: String,
-    #[serde(default)]
     pub modifiers: Modifiers,
-    /// Optional window ID to target (falls back to active window, then first window)
-    #[serde(default)]
     pub window_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Modifiers {
-    #[serde(default)]
     pub ctrl: bool,
-    #[serde(default)]
     pub alt: bool,
-    #[serde(default)]
     pub shift: bool,
-    #[serde(default)]
     pub meta: bool,
 }
 
@@ -132,20 +112,15 @@ pub mod methods {
     pub const GET_ELEMENT: &str = "get_element";
     pub const GET_WINDOWS: &str = "get_windows";
     pub const TAKE_SCREENSHOT: &str = "take_screenshot";
-
+    
     /// Automatisierung
     pub const CLICK_ELEMENT: &str = "click_element";
     pub const SEND_KEY: &str = "send_key";
     pub const EXECUTE_ACTION: &str = "execute_action";
-
-    /// Text input
-    pub const TYPE_TEXT: &str = "type_text";
-
-    /// State & Debug
+    
+    /// State
     pub const GET_APP_STATE: &str = "get_app_state";
     pub const GET_LOGS: &str = "get_logs";
-    pub const LIST_ACTIONS: &str = "list_actions";
-    pub const GET_FOCUS_INFO: &str = "get_focus_info";
 }
 
 /// Params für verschiedene Methods
@@ -156,71 +131,12 @@ pub struct GetElementParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TakeScreenshotParams {
-    #[serde(default)]
     pub highlight_elements: Vec<String>,
-    #[serde(default)]
     pub window_id: Option<String>,
-    /// If set, crop the screenshot to this element's bounds.
-    /// Supports full_id, global_id, or suffix match.
-    #[serde(default)]
-    pub element_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteActionParams {
     pub action: String,
-    #[serde(default)]
     pub args: serde_json::Value,
-    #[serde(default)]
-    pub window_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InspectUiTreeParams {
-    /// Maximum depth of the tree to return (0 = unlimited)
-    #[serde(default)]
-    pub max_depth: usize,
-    /// Only return elements from this window
-    #[serde(default)]
-    pub window_id: Option<String>,
-    /// Only return elements matching this type substring
-    #[serde(default)]
-    pub element_type_filter: Option<String>,
-    /// Start the tree at this element ID instead of the root.
-    /// Supports full_id, global_id, or suffix match (same as get_element).
-    #[serde(default)]
-    pub root_element_id: Option<String>,
-    /// Output format: "full" (default) or "compact" (strips bounds, content_mask,
-    /// source_location, content_size, style_json — keeps id, element_type, children, properties).
-    #[serde(default)]
-    pub format: Option<String>,
-    /// Only return elements whose text_content contains this substring (case-insensitive).
-    /// Elements are kept if they match or have matching descendants.
-    #[serde(default)]
-    pub text_filter: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListActionsParams {
-    /// Filter actions by name substring
-    #[serde(default)]
-    pub filter: Option<String>,
-    /// If true, include keybinding and context info for each action
-    #[serde(default)]
-    pub include_bindings: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TypeTextParams {
-    /// The text string to type into the focused element
-    pub text: String,
-    /// Optional window ID to target (falls back to active window)
-    #[serde(default)]
-    pub window_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetFocusInfoParams {
-    #[serde(default)]
-    pub window_id: Option<String>,
 }

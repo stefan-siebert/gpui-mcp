@@ -16,6 +16,9 @@ base64 = "0.22"
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1.1"
 
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1"
+
 [[bin]]
 name = "gpui-mcp-server"
 path = "src/main.rs"
