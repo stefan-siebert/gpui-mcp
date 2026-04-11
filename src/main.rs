@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::time::SystemTime;
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -18,72 +19,148 @@ struct GpuiMcpServer {
     socket_path: String,
 }
 
-/// Discover running GPUI MCP instances by scanning for socket files.
-/// Returns a list of socket paths sorted by most recent (newest first).
-fn discover_instances() -> Vec<String> {
-    let temp_dir = std::env::temp_dir();
-    let mut sockets = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with("gpui-mcp-") && name_str.ends_with(".sock") {
-                let path = entry.path().to_string_lossy().into_owned();
-                // Check if the socket is actually connectable
-                let connectable = UnixStream::connect(&path).is_ok();
-                if connectable {
-                    sockets.push(path);
-                } else {
-                    // Stale socket — clean up
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-
-    // Sort by modification time (newest first)
-    sockets.sort_by(|a, b| {
-        let time_a = std::fs::metadata(a).and_then(|m| m.modified()).ok();
-        let time_b = std::fs::metadata(b).and_then(|m| m.modified()).ok();
-        time_b.cmp(&time_a)
-    });
-
-    sockets
+/// One discovered GPUI app instance reachable via its MCP socket.
+#[derive(Debug, Clone)]
+struct Instance {
+    app_name: String,
+    pid: u32,
+    path: String,
+    mtime: SystemTime,
 }
 
-/// Resolve the socket path to connect to.
-/// Priority: GPUI_MCP_SOCKET env > GPUI_MCP_PID env > auto-discovery
-fn resolve_socket_path() -> Result<String> {
-    // Explicit socket path
-    if let Ok(path) = std::env::var("GPUI_MCP_SOCKET") {
-        return Ok(path);
+/// Parse a gpui-mcp socket filename into `(app_name, pid)`.
+///
+/// Expected format: `gpui-mcp-{app_name}-{pid}.sock`. The app name may itself
+/// contain `-`, so we split on the *last* `-` to isolate the numeric PID.
+/// Returns `None` for any filename that doesn't match or has a non-numeric PID.
+fn parse_socket_name(name: &str) -> Option<(String, u32)> {
+    let middle = name.strip_prefix("gpui-mcp-")?.strip_suffix(".sock")?;
+    let last_dash = middle.rfind('-')?;
+    let (app, pid_part) = middle.split_at(last_dash);
+    // pid_part starts with '-'; skip it
+    let pid: u32 = pid_part.get(1..)?.parse().ok()?;
+    if app.is_empty() {
+        return None;
+    }
+    Some((app.to_string(), pid))
+}
+
+/// Discover running GPUI MCP instances by scanning `temp_dir` for sockets.
+///
+/// If `app_filter` is `Some`, only instances with that app name are returned.
+/// The list is sorted by mtime, newest first. Stale (non-connectable) sockets
+/// are removed as a side effect.
+fn discover_instances(app_filter: Option<&str>) -> Vec<Instance> {
+    let temp_dir = std::env::temp_dir();
+    let mut instances = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(&temp_dir) else {
+        return instances;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        let Some((app_name, pid)) = parse_socket_name(&name_str) else {
+            continue;
+        };
+
+        if let Some(filter) = app_filter {
+            if app_name != filter {
+                continue;
+            }
+        }
+
+        let path = entry.path().to_string_lossy().into_owned();
+
+        // Drop stale sockets that nothing is listening on.
+        if UnixStream::connect(&path).is_err() {
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        }
+
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        instances.push(Instance {
+            app_name,
+            pid,
+            path,
+            mtime,
+        });
     }
 
-    // Explicit PID
-    if let Ok(pid) = std::env::var("GPUI_MCP_PID") {
+    instances.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    instances
+}
+
+/// Resolve which socket to connect to.
+///
+/// Priority:
+/// 1. `GPUI_MCP_APP` + `GPUI_MCP_PID` → exact path (no discovery)
+/// 2. `GPUI_MCP_APP` alone → discover filtered by app, pick newest
+/// 3. neither → discover all apps, pick newest, warn on ambiguity
+fn resolve_socket_path() -> Result<String> {
+    let app = std::env::var("GPUI_MCP_APP").ok();
+    let pid = std::env::var("GPUI_MCP_PID").ok();
+
+    if let (Some(app), Some(pid)) = (app.as_deref(), pid.as_deref()) {
         let path = std::env::temp_dir()
-            .join(format!("gpui-mcp-{}.sock", pid))
+            .join(format!("gpui-mcp-{}-{}.sock", app, pid))
             .to_string_lossy()
             .into_owned();
         return Ok(path);
     }
 
-    // Auto-discover
-    let instances = discover_instances();
+    if pid.is_some() && app.is_none() {
+        return Err(anyhow::anyhow!(
+            "GPUI_MCP_PID requires GPUI_MCP_APP to be set as well \
+             (socket names now include the app name)."
+        ));
+    }
+
+    let instances = discover_instances(app.as_deref());
+
     match instances.len() {
-        0 => Err(anyhow::anyhow!(
-            "No running GPUI app found. Looked for gpui-mcp-*.sock in {}",
-            std::env::temp_dir().display()
-        )),
-        1 => Ok(instances.into_iter().next().unwrap()),
-        n => {
+        0 => {
+            let scope = match app.as_deref() {
+                Some(a) => format!(" for app '{}'", a),
+                None => String::new(),
+            };
+            Err(anyhow::anyhow!(
+                "No running GPUI app found{}. Scanned: {}",
+                scope,
+                std::env::temp_dir().display()
+            ))
+        }
+        1 => Ok(instances.into_iter().next().unwrap().path),
+        _ => {
+            let chosen = instances[0].clone();
+            let scope = app
+                .as_deref()
+                .map(|a| format!(" of '{}'", a))
+                .unwrap_or_default();
             eprintln!(
-                "[MCP] Found {} GPUI instances, connecting to most recent. \
-                 Set GPUI_MCP_PID to target a specific one.",
-                n
+                "[MCP] Found {} instances{}. Connecting to newest: app='{}', pid={}.",
+                instances.len(),
+                scope,
+                chosen.app_name,
+                chosen.pid
             );
-            Ok(instances.into_iter().next().unwrap())
+            eprintln!("[MCP] Other instances:");
+            for inst in instances.iter().skip(1) {
+                eprintln!(
+                    "[MCP]   - app='{}', pid={}, path={}",
+                    inst.app_name, inst.pid, inst.path
+                );
+            }
+            eprintln!(
+                "[MCP] Set GPUI_MCP_APP (and optionally GPUI_MCP_PID) to target a specific one."
+            );
+            Ok(chosen.path)
         }
     }
 }
@@ -459,7 +536,18 @@ fn main() -> Result<()> {
     let server = GpuiMcpServer::new(socket_path.clone());
 
     eprintln!("GPUI MCP Server starting...");
-    eprintln!("Connected to GPUI app via: {}", socket_path);
+    match parse_socket_name(
+        std::path::Path::new(&socket_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(""),
+    ) {
+        Some((app, pid)) => eprintln!(
+            "Connected to GPUI app '{}' (pid {}) via: {}",
+            app, pid, socket_path
+        ),
+        None => eprintln!("Connected to GPUI app via: {}", socket_path),
+    }
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -613,4 +701,66 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_basic_name() {
+        assert_eq!(
+            parse_socket_name("gpui-mcp-elane-12345.sock"),
+            Some(("elane".to_string(), 12345))
+        );
+    }
+
+    #[test]
+    fn parse_app_name_with_dashes() {
+        assert_eq!(
+            parse_socket_name("gpui-mcp-my-editor-42.sock"),
+            Some(("my-editor".to_string(), 42))
+        );
+        assert_eq!(
+            parse_socket_name("gpui-mcp-a-b-c-7.sock"),
+            Some(("a-b-c".to_string(), 7))
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_prefix() {
+        assert_eq!(parse_socket_name("other-thing-1.sock"), None);
+        assert_eq!(parse_socket_name("gpui-foo-1.sock"), None);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_suffix() {
+        assert_eq!(parse_socket_name("gpui-mcp-elane-1.txt"), None);
+        assert_eq!(parse_socket_name("gpui-mcp-elane-1"), None);
+    }
+
+    #[test]
+    fn parse_rejects_non_numeric_pid() {
+        assert_eq!(parse_socket_name("gpui-mcp-elane-abc.sock"), None);
+    }
+
+    #[test]
+    fn parse_rejects_empty_app_name() {
+        // "gpui-mcp--123.sock" → middle = "-123" → last_dash at 0 → app = "" → reject
+        assert_eq!(parse_socket_name("gpui-mcp--123.sock"), None);
+    }
+
+    #[test]
+    fn parse_rejects_missing_pid_separator() {
+        // No dash at all between app and pid: "gpui-mcp-elane.sock" → middle = "elane" → no '-'
+        assert_eq!(parse_socket_name("gpui-mcp-elane.sock"), None);
+    }
+
+    #[test]
+    fn parse_accepts_numeric_app_name() {
+        assert_eq!(
+            parse_socket_name("gpui-mcp-123-456.sock"),
+            Some(("123".to_string(), 456))
+        );
+    }
 }
