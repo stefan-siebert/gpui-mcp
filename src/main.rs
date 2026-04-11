@@ -391,7 +391,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "list_actions",
-                "description": "List all registered GPUI actions that can be dispatched via execute_action. Actions are the keyboard shortcuts and commands of the app (e.g. 'elane::CursorUp', 'elane::ToggleTerminal'). Use filter to search by name substring. Set include_bindings=true to get keybinding and context info for each action.",
+                "description": "List GPUI actions that can be dispatched via execute_action. Actions are the keyboard shortcuts and commands of the app (e.g. 'elane::CursorUp', 'elane::ToggleTerminal'). Use filter to search by name substring. Set include_bindings=true for keybinding and context info. Set only_available=true to restrict results to actions whose binding context matches the current focus chain — i.e. 'what can I actually press right now?' (implies include_bindings=true).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -402,6 +402,14 @@ fn tools_list() -> serde_json::Value {
                         "include_bindings": {
                             "type": "boolean",
                             "description": "If true, return keybinding, context, and documentation for each action instead of just names. Default: false."
+                        },
+                        "only_available": {
+                            "type": "boolean",
+                            "description": "If true, only return actions whose keybinding predicate matches the current focus chain. Implies include_bindings=true. Default: false."
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to evaluate only_available against (default: active window)"
                         }
                     },
                     "required": []

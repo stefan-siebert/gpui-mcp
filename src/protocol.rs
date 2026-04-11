@@ -203,6 +203,16 @@ pub struct ListActionsParams {
     /// If true, include keybinding and context info for each action
     #[serde(default)]
     pub include_bindings: bool,
+    /// If true, only return actions whose key-binding predicate matches
+    /// the current focus chain in the target window — i.e. actions that
+    /// would actually fire if their keybinding were pressed right now.
+    /// Implies `include_bindings: true` since the filter depends on
+    /// binding predicates.
+    #[serde(default)]
+    pub only_available: bool,
+    /// Window to evaluate `only_available` against (defaults to active window)
+    #[serde(default)]
+    pub window_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
