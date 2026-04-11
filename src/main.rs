@@ -14,10 +14,12 @@ use gpui_mcp_protocol::protocol::*;
 /// MCP Server for GPUI inspection and automation.
 ///
 /// Communicates over stdio with Claude (MCP Protocol)
-/// Communicates over Unix Domain Socket with the GPUI App
-struct GpuiMcpServer {
-    socket_path: String,
-}
+/// Communicates over Unix Domain Socket with the GPUI App.
+///
+/// Holds no cached socket path: every tool call re-resolves via
+/// `resolve_socket_path()` so the server survives GPUI app restarts
+/// (which change the PID and therefore the socket filename).
+struct GpuiMcpServer;
 
 /// One discovered GPUI app instance reachable via its MCP socket.
 #[derive(Debug, Clone)]
@@ -166,13 +168,19 @@ fn resolve_socket_path() -> Result<String> {
 }
 
 impl GpuiMcpServer {
-    fn new(socket_path: String) -> Self {
-        Self { socket_path }
+    fn new() -> Self {
+        Self
     }
 
+    /// Resolve the current socket path and open a connection.
+    ///
+    /// Re-resolves every call so a GPUI app restart (new PID = new socket
+    /// filename) is transparently picked up. `discover_instances` inside
+    /// `resolve_socket_path` also removes stale sockets as a side effect.
     fn connect(&self) -> Result<UnixStream> {
-        UnixStream::connect(&self.socket_path)
-            .with_context(|| format!("GPUI app not running or not reachable at {}", self.socket_path))
+        let path = resolve_socket_path()?;
+        UnixStream::connect(&path)
+            .with_context(|| format!("GPUI app not running or not reachable at {}", path))
     }
 
     fn send_ipc_request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
@@ -532,21 +540,32 @@ fn tools_list() -> serde_json::Value {
 }
 
 fn main() -> Result<()> {
-    let socket_path = resolve_socket_path()?;
-    let server = GpuiMcpServer::new(socket_path.clone());
+    let server = GpuiMcpServer::new();
 
     eprintln!("GPUI MCP Server starting...");
-    match parse_socket_name(
-        std::path::Path::new(&socket_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(""),
-    ) {
-        Some((app, pid)) => eprintln!(
-            "Connected to GPUI app '{}' (pid {}) via: {}",
-            app, pid, socket_path
-        ),
-        None => eprintln!("Connected to GPUI app via: {}", socket_path),
+
+    // Informational only — the server does not cache this path. Each
+    // tool call re-resolves to handle GPUI app restarts transparently.
+    match resolve_socket_path() {
+        Ok(path) => {
+            let file_name = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            match parse_socket_name(file_name) {
+                Some((app, pid)) => eprintln!(
+                    "Initial resolve: app='{}', pid={}, path={}",
+                    app, pid, path
+                ),
+                None => eprintln!("Initial resolve: {}", path),
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "Initial resolve: no GPUI app running yet ({}). Will retry on each tool call.",
+                err
+            );
+        }
     }
 
     let stdin = std::io::stdin();
