@@ -80,6 +80,27 @@ async fn main() {
 # (gleicher Inhalt wie macOS)
 ```
 
+## 3b. Konfiguriere Claude Code (CLI)
+
+Ein Befehl pro Projekt, im Projektverzeichnis der GPUI-App ausführen.
+`GPUI_MCP_APP` ist der Name aus `init_mcp(cx, "<name>")`; ohne ihn verbindet
+der Server die neueste laufende GPUI-App, mit ihm gezielt diese eine:
+
+```bash
+# Elane
+claude mcp add --transport stdio gpui-inspector --env GPUI_MCP_APP=elane -- /absolute/path/to/gpui-mcp/target/release/gpui-mcp-server
+# speedy (Windows)
+claude mcp add --transport stdio gpui-inspector --env GPUI_MCP_APP=speedy -- C:/_work/projects/gpui-mcp/target/release/gpui-mcp-server.exe
+```
+
+Der Default-Scope `local` trägt den Server privat für dieses Projekt in
+`~/.claude.json` ein; `-s project` schreibt stattdessen eine `.mcp.json` ins
+Repo (für alle, die es auschecken — wird beim ersten Start bestätigt), `-s user`
+gilt in allen Projekten (dann `GPUI_MCP_APP` weglassen). Prüfen mit
+`claude mcp get gpui-inspector` (Status „Connected" braucht eine laufende App
+mit `init_mcp`); eine laufende Claude-Code-Session muss neu gestartet werden,
+damit die Tools (`mcp__gpui-inspector__*`) erscheinen.
+
 ## 4. Testen
 
 1. **Starte Elane** (mit IPC Server Integration)
