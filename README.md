@@ -213,9 +213,7 @@ CI (`.github/workflows/ci.yml`) runs the same three on Linux and Windows.
 This repo is deliberately small: the binary in `src/main.rs`, the wire types
 in `src/protocol.rs`. The in-app logic (main-thread dispatch, how gpui's flat
 inspector list becomes a tree, rendering screenshots) lives in
-`gpui_component::mcp`. An app using it today:
-[speedy](https://github.com/stefan-siebert/speedy) — `speedy-gui-gpui`, built
-with `cargo xtask gui-gpui`.
+`gpui_component::mcp`.
 
 ## License
 
