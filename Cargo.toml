@@ -1,7 +1,15 @@
 [package]
 name = "gpui-mcp-inspector"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.80"
+description = "MCP server that lets an AI agent inspect and drive a running GPUI application"
+repository = "https://github.com/stefan-siebert/gpui-mcp"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["gpui", "mcp", "inspector", "automation"]
+categories = ["development-tools::testing", "gui"]
+publish = false
 
 [workspace]
 
@@ -9,21 +17,21 @@ edition = "2021"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
-thiserror = "2.0"
 uuid = { version = "1.11", features = ["v4"] }
 base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1.1"
 
+# The binary an MCP client launches.
 [[bin]]
 name = "gpui-mcp-server"
 path = "src/main.rs"
 
+# The wire types, consumed by the in-app side (`gpui_component::mcp`).
+# Dependents name the package but import the lib:
+#   gpui-mcp-protocol = { package = "gpui-mcp-inspector", git = "..." }
+#   use gpui_mcp_protocol::protocol::*;
 [lib]
 name = "gpui_mcp_protocol"
 path = "src/lib.rs"
-
-[[example]]
-name = "gpui_integration"
-path = "examples/gpui_integration.rs"

@@ -1,56 +1,51 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
-## Project Overview
+## What this is
 
-**gpui-mcp-inspector** is a Rust MCP (Model Context Protocol) server that enables Claude to inspect and interact with GPUI-based applications (like Elane) via UI inspection, screenshots, and event simulation. Documentation is written in German.
-
-### Two-Layer Communication Architecture
+`gpui-mcp-inspector` — an MCP server (`gpui-mcp-server` binary) that lets an AI
+agent inspect and drive a running GPUI app, plus the wire types
+(`gpui_mcp_protocol` lib) shared with the in-app side. README.md is the
+authoritative description; keep it in sync when behaviour changes.
 
 ```
-Claude Desktop ←→ gpui-mcp-server (stdio, JSON-RPC 2.0) ←→ GPUI App (Unix socket, newline-delimited JSON)
+MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJSON──▶ gpui_component::mcp (in the app)
 ```
 
-- **MCP Server** (`main.rs`): Binary that reads MCP requests from stdin, forwards them to the GPUI app over a Unix socket, and returns results on stdout. Synchronous stdio loop with async socket communication.
-- **Protocol Library** (`protocol.rs`): Shared types (`UiElement`, `UiTree`, `WindowInfo`, `IpcRequest`/`IpcResponse`, etc.) published as the `gpui_mcp_protocol` crate.
-- **GPUI Integration** (`gpui_integration.rs`): Reference implementation showing the `AppInterface` trait and `GpuiIpcServer`. GPUI apps implement `AppInterface` to expose their UI tree, handle clicks/keys, and provide state.
+- `src/main.rs` — the server: MCP stdio loop, socket discovery, tool list,
+  forwards each tool call as one IPC request on a fresh connection.
+- `src/protocol.rs` — `IpcRequest`/`IpcResponse`, `UiElement`, param structs,
+  `methods::*` constants. Tool names == IPC method names.
+- The in-app side is **not** here: it is the `mcp` module/feature of
+  [stefan-siebert/gpui-component](https://github.com/stefan-siebert/gpui-component),
+  which depends on this repo by git (`package = "gpui-mcp-inspector"`, imports
+  `gpui_mcp_protocol::protocol::*`).
 
-## Build & Dev Commands
+## Rules
 
-```bash
-make build       # cargo build (debug)
-make release     # cargo build --release
-make test        # cargo test
-make lint        # cargo clippy -- -D warnings
-make fmt         # cargo fmt
-make check       # cargo check (type-check only)
-make example     # cargo run --example gpui_integration
-make watch       # cargo watch -x build (requires cargo-watch)
+- **Do not rename** the package (`gpui-mcp-inspector`) or the lib
+  (`gpui_mcp_protocol`): gpui-component and CI builds resolve both by name.
+- Changes to `protocol.rs` are wire changes. Additions must be `#[serde(default)]`
+  so an older app and a newer server (or vice versa) keep talking. Check
+  `../gpui-component/crates/ui/src/mcp.rs` before removing or renaming anything.
+- Adding a tool: add the method constant and `methods::ALL` entry in
+  `protocol.rs`, a params struct if needed, the JSON schema in `tools_list()`
+  in `main.rs`, the handler in gpui-component, and the row in README.md.
+- Docs and code comments in English.
+
+## Commands
+
+```sh
+cargo build --release                       # → target/release/gpui-mcp-server
+cargo test
+cargo clippy --all-targets -- -D warnings   # CI gate
+cargo fmt --check                           # CI gate
 ```
 
-## Key Trait: `AppInterface`
+## Environment
 
-Defined in `gpui_integration.rs`. Any GPUI app must implement this to be inspectable:
-- `get_ui_tree()`, `get_element()`, `get_windows()`, `take_screenshot()` — inspection
-- `click_element()`, `send_key()`, `execute_action()` — automation
-- `get_app_state()`, `get_logs()` — debugging
-
-## MCP Tools Exposed
-
-Inspection: `inspect_ui_tree`, `get_element`, `get_windows`, `take_screenshot`
-Automation: `click_element`, `send_key`, `execute_action`
-State: `get_app_state`, `get_logs`
-
-Method constants are in `protocol::methods`.
-
-## Environment Variables
-
-- `GPUI_MCP_SOCKET` — Unix socket path (default: `/tmp/gpui-mcp.sock`)
-
-## Design Notes
-
-- Each MCP request opens a new socket connection (stateless)
-- Cross-thread data uses `Arc<Mutex<>>`
-- Debug output goes to stderr (useful for debugging via `2>/tmp/mcp-debug.log`)
-- Local-only security model via Unix sockets — not for production builds
+- `GPUI_MCP_APP` — app name passed to `init_mcp`; restricts discovery.
+- `GPUI_MCP_PID` — with `GPUI_MCP_APP`: exact socket, no discovery.
+- Sockets: `{temp_dir}/gpui-mcp-{app}-{pid}.sock`. Discovery deletes stale ones.
+- Diagnostics go to stderr; stdout is reserved for MCP JSON-RPC.

@@ -204,15 +204,20 @@ lives in a per-user temp directory but is not otherwise authenticated.
 ## Developing
 
 ```sh
-cargo test                 # protocol + socket-name parsing
-cargo run --example gpui_integration
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test                 # protocol serde defaults + socket-name parsing
 ```
 
-`IMPLEMENTATION.md` holds the design notes (main-thread dispatch, how the flat
-inspector list becomes a tree, the screenshot path). An app using it today:
+CI (`.github/workflows/ci.yml`) runs the same three on Linux and Windows.
+This repo is deliberately small: the binary in `src/main.rs`, the wire types
+in `src/protocol.rs`. The in-app logic (main-thread dispatch, how gpui's flat
+inspector list becomes a tree, rendering screenshots) lives in
+`gpui_component::mcp`. An app using it today:
 [speedy](https://github.com/stefan-siebert/speedy) — `speedy-gui-gpui`, built
 with `cargo xtask gui-gpui`.
 
 ## License
 
-Intended MIT OR Apache-2.0; LICENSE files are not in the repo yet.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.

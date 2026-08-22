@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::time::SystemTime;
 
 #[cfg(unix)]
@@ -95,7 +95,7 @@ fn discover_instances(app_filter: Option<&str>) -> Vec<Instance> {
         });
     }
 
-    instances.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    instances.sort_by_key(|i| std::cmp::Reverse(i.mtime));
     instances
 }
 
@@ -183,7 +183,11 @@ impl GpuiMcpServer {
             .with_context(|| format!("GPUI app not running or not reachable at {}", path))
     }
 
-    fn send_ipc_request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    fn send_ipc_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let mut stream = self.connect()?;
 
         let request = IpcRequest {
@@ -197,17 +201,16 @@ impl GpuiMcpServer {
         stream.write_all(b"\n")?;
         stream.flush()?;
 
-        let mut response_buf = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            stream.read_exact(&mut byte)?;
-            if byte[0] == b'\n' {
-                break;
-            }
-            response_buf.push(byte[0]);
+        let mut response_line = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut response_line)
+            .context("Failed to read IPC response")?;
+        if response_line.trim().is_empty() {
+            anyhow::bail!("GPUI app closed the connection without a response");
         }
 
-        let response: IpcResponse = serde_json::from_slice(&response_buf)?;
+        let response: IpcResponse =
+            serde_json::from_str(&response_line).context("Failed to parse IPC response")?;
 
         match response.result {
             Ok(value) => Ok(value),
@@ -215,69 +218,42 @@ impl GpuiMcpServer {
         }
     }
 
-    fn handle_tool_call(&self, tool_name: &str, arguments: serde_json::Value) -> Result<serde_json::Value> {
-        match tool_name {
-            "inspect_ui_tree" => {
-                self.send_ipc_request(methods::INSPECT_UI_TREE, arguments)
-            }
-            "get_element" => {
-                self.send_ipc_request(methods::GET_ELEMENT, arguments)
-            }
-            "get_windows" => {
-                self.send_ipc_request(methods::GET_WINDOWS, json!({}))
-            }
-            "take_screenshot" => {
-                let result = self.send_ipc_request(methods::TAKE_SCREENSHOT, arguments)?;
-
-                // The IPC response contains a file path to the PNG screenshot.
-                // Read it, encode as base64, and clean up the temp file.
-                let path = result["path"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Screenshot response missing 'path'"))?;
-
-                let png_data = std::fs::read(path)
-                    .with_context(|| format!("Failed to read screenshot file: {}", path))?;
-
-                // Clean up temp file
-                let _ = std::fs::remove_file(path);
-
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-
-                Ok(json!({
-                    "width": result["width"],
-                    "height": result["height"],
-                    "format": "png",
-                    "data": b64,
-                    "encoding": "base64",
-                }))
-            }
-            "click_element" => {
-                self.send_ipc_request(methods::CLICK_ELEMENT, arguments)
-            }
-            "send_key" => {
-                self.send_ipc_request(methods::SEND_KEY, arguments)
-            }
-            "execute_action" => {
-                self.send_ipc_request(methods::EXECUTE_ACTION, arguments)
-            }
-            "get_app_state" => {
-                self.send_ipc_request(methods::GET_APP_STATE, json!({}))
-            }
-            "get_logs" => {
-                self.send_ipc_request(methods::GET_LOGS, json!({}))
-            }
-            "list_actions" => {
-                self.send_ipc_request(methods::LIST_ACTIONS, arguments)
-            }
-            "get_focus_info" => {
-                self.send_ipc_request(methods::GET_FOCUS_INFO, arguments)
-            }
-            "type_text" => {
-                self.send_ipc_request(methods::TYPE_TEXT, arguments)
-            }
-            _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
+    /// Forward a tool call to the app. Tool names equal IPC method names;
+    /// `take_screenshot` additionally turns the PNG path the app returns into
+    /// inline base64 data.
+    fn handle_tool_call(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        if !methods::ALL.contains(&tool_name) {
+            anyhow::bail!("Unknown tool: {}", tool_name);
         }
+
+        let result = self.send_ipc_request(tool_name, arguments)?;
+        if tool_name != methods::TAKE_SCREENSHOT {
+            return Ok(result);
+        }
+
+        let shot: ScreenshotResult = serde_json::from_value(result)
+            .context("Unexpected take_screenshot response from app")?;
+
+        let png_data = std::fs::read(&shot.path)
+            .with_context(|| format!("Failed to read screenshot file: {}", shot.path))?;
+        // The file is a temp handoff from the app; it is ours to delete.
+        let _ = std::fs::remove_file(&shot.path);
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+
+        Ok(json!({
+            "width": shot.width,
+            "height": shot.height,
+            "format": "png",
+            "data": b64,
+            "encoding": "base64",
+            "element_id": shot.element_id,
+        }))
     }
 }
 
@@ -561,10 +537,9 @@ fn main() -> Result<()> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             match parse_socket_name(file_name) {
-                Some((app, pid)) => eprintln!(
-                    "Initial resolve: app='{}', pid={}, path={}",
-                    app, pid, path
-                ),
+                Some((app, pid)) => {
+                    eprintln!("Initial resolve: app='{}', pid={}, path={}", app, pid, path)
+                }
                 None => eprintln!("Initial resolve: {}", path),
             }
         }
@@ -599,21 +574,24 @@ fn main() -> Result<()> {
         match request.method.as_str() {
             // MCP lifecycle
             "initialize" => {
-                send_response(&mut stdout, &McpResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id,
-                    result: Some(json!({
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": "gpui-mcp-inspector",
-                            "version": "0.2.0"
-                        }
-                    })),
-                    error: None,
-                })?;
+                send_response(
+                    &mut stdout,
+                    &McpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {
+                                "tools": {}
+                            },
+                            "serverInfo": {
+                                "name": "gpui-mcp-inspector",
+                                "version": env!("CARGO_PKG_VERSION")
+                            }
+                        })),
+                        error: None,
+                    },
+                )?;
             }
 
             // Client sends this after initialize — acknowledge silently
@@ -624,21 +602,27 @@ fn main() -> Result<()> {
 
             // Health check
             "ping" => {
-                send_response(&mut stdout, &McpResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id,
-                    result: Some(json!({})),
-                    error: None,
-                })?;
+                send_response(
+                    &mut stdout,
+                    &McpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(json!({})),
+                        error: None,
+                    },
+                )?;
             }
 
             "tools/list" => {
-                send_response(&mut stdout, &McpResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id,
-                    result: Some(tools_list()),
-                    error: None,
-                })?;
+                send_response(
+                    &mut stdout,
+                    &McpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(tools_list()),
+                        error: None,
+                    },
+                )?;
             }
 
             "tools/call" => {
@@ -651,36 +635,22 @@ fn main() -> Result<()> {
                 let response = match result {
                     Ok(content) => {
                         // For screenshots, return as MCP image content
-                        let mcp_content = if tool_name == "take_screenshot" {
-                            if let (Some(data), Some(mime)) = (content["data"].as_str(), Some("image/png")) {
-                                json!({
-                                    "content": [
-                                        {
-                                            "type": "image",
-                                            "data": data,
-                                            "mimeType": mime,
-                                        },
-                                        {
-                                            "type": "text",
-                                            "text": format!("Screenshot: {}x{}", content["width"], content["height"])
-                                        }
-                                    ]
-                                })
-                            } else {
-                                json!({
-                                    "content": [{
+                        let mcp_content = match content["data"].as_str() {
+                            Some(data) if tool_name == methods::TAKE_SCREENSHOT => json!({
+                                "content": [
+                                    { "type": "image", "data": data, "mimeType": "image/png" },
+                                    {
                                         "type": "text",
-                                        "text": serde_json::to_string_pretty(&content)?
-                                    }]
-                                })
-                            }
-                        } else {
-                            json!({
+                                        "text": format!("Screenshot: {}x{}", content["width"], content["height"])
+                                    }
+                                ]
+                            }),
+                            _ => json!({
                                 "content": [{
                                     "type": "text",
                                     "text": serde_json::to_string_pretty(&content)?
                                 }]
-                            })
+                            }),
                         };
 
                         McpResponse {
@@ -713,15 +683,18 @@ fn main() -> Result<()> {
                     // Notifications don't need responses
                     eprintln!("[MCP] Ignoring unknown notification: {}", method);
                 } else {
-                    send_response(&mut stdout, &McpResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id,
-                        result: None,
-                        error: Some(McpError {
-                            code: -32601,
-                            message: format!("Method not found: {}", method),
-                        }),
-                    })?;
+                    send_response(
+                        &mut stdout,
+                        &McpResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            result: None,
+                            error: Some(McpError {
+                                code: -32601,
+                                message: format!("Method not found: {}", method),
+                            }),
+                        },
+                    )?;
                 }
             }
         }
