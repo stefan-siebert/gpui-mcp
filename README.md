@@ -1,237 +1,218 @@
-# GPUI MCP Inspector
+# gpui-mcp — an MCP inspector for GPUI apps
 
-Model Context Protocol (MCP) Server für GPUI-basierte Anwendungen. Ermöglicht Claude direkten Zugriff auf UI-Struktur, State und Interaktionsmöglichkeiten deiner GPUI App.
+Lets an AI agent (Claude Code, Claude Desktop, anything that speaks the
+[Model Context Protocol](https://modelcontextprotocol.io)) **look at and drive a
+running [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
+application**: read the element tree with bounds and source locations, see
+what has focus and which key contexts are active, type, press keys, click,
+dispatch named actions, take screenshots, and read an app-defined state
+snapshot. The agent verifies a GUI change the way a person would — by using
+the app — instead of guessing from the code or blind-firing `SendKeys`.
 
-## Was ist das?
+Works on Linux, macOS and Windows.
 
-Ein Toolkit bestehend aus:
-
-1. **MCP Server** (`gpui-mcp-server`) - Kommuniziert mit Claude über stdio
-2. **IPC Protocol** - Shared types für die Kommunikation
-3. **GPUI Integration** - Code zum Einbauen in deine GPUI App (z.B. Elane)
-
-## Workflow
+## How it fits together
 
 ```
-Claude (claude.ai/app)
-    ↓ MCP Protocol (stdio)
-gpui-mcp-server
-    ↓ IPC (Unix Socket)
-Deine GPUI App (Elane)
+ Claude Code / Claude Desktop
+        │  MCP over stdio (JSON-RPC)
+        ▼
+ gpui-mcp-server            ← this repo: src/main.rs
+        │  one JSON request per connection over a Unix-domain socket
+        │  {temp_dir}/gpui-mcp-{app}-{pid}.sock   (uds_windows on Windows)
+        ▼
+ your GPUI app
+   gpui_component::mcp       ← the in-app side: a listener thread queues each
+                               request; the GPUI main thread polls the queue
+                               and answers from gpui's inspector data
 ```
 
-## Verfügbare Tools
+Three pieces, in three repositories:
 
-### UI Inspektion
-- `inspect_ui_tree` - Komplette UI-Hierarchie mit Bounds und Properties
-- `get_element` - Details zu einem spezifischen Element
-- `get_windows` - Liste aller Fenster
-- `take_screenshot` - Screenshot mit optionalen Element-Highlights
+| piece | where | what it is |
+|---|---|---|
+| `gpui-mcp-server` binary | this repo, `src/main.rs` | the MCP server an agent talks to; discovers the app's socket, forwards tool calls |
+| `gpui_mcp_protocol` library | this repo, `src/lib.rs`, `src/protocol.rs` | the request/response types shared by both ends |
+| `gpui_component::mcp` module | [stefan-siebert/gpui-component](https://github.com/stefan-siebert/gpui-component), feature `mcp` | the in-app server: socket, main-thread dispatch, element tree, screenshots, `init_mcp()` |
 
-### Automatisierung
-- `click_element` - Maus-Clicks simulieren
-- `send_key` - Keyboard-Input senden
-- `execute_action` - Benannte Actions ausführen
+The element tree and screenshots come from gpui's inspector API, which
+upstream exposes only partially — the
+[stefan-siebert/zed](https://github.com/stefan-siebert/zed) fork, branch
+`gpui-mcp-patches-v2`, carries the patches (`window.inspector_elements()`,
+`window.render_to_image()`). gpui-component's `mcp` feature enables gpui's
+`inspector` feature and depends on that fork, so an app gets the whole stack
+by depending on gpui-component alone.
 
-### Debugging
-- `get_app_state` - App-State Snapshot
-- `get_logs` - Recent Logs
+## Building the server
 
-## Setup
-
-### 1. MCP Server bauen
-
-```bash
+```sh
 cargo build --release
+# → target/release/gpui-mcp-server   (.exe on Windows)
 ```
 
-Der Binary landet in `target/release/gpui-mcp-server`.
+No runtime dependencies. The binary is small and stateless: it re-discovers
+the app's socket on **every** tool call, so restarting the app (new PID, new
+socket name) needs no restart of the server or of the agent session.
 
-### 2. In GPUI App integrieren
+## Putting it into an app
 
-Siehe `examples/gpui_integration.rs` für ein vollständiges Beispiel.
+1. Depend on gpui-component with the feature on — behind a feature of your
+   own, so the shipped binary does not carry an IPC server:
 
-**Minimale Integration:**
+   ```toml
+   [features]
+   mcp = ["gpui-component/mcp"]
 
-```rust
-use gpui_mcp_protocol::*;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+   [dependencies]
+   gpui = { git = "https://github.com/stefan-siebert/zed", branch = "gpui-mcp-patches-v2" }
+   gpui-component = { git = "https://github.com/stefan-siebert/gpui-component", branch = "main" }
+   ```
 
-// 1. Implementiere AppInterface für deine App
-impl AppInterface for MyGpuiApp {
-    fn get_ui_tree(&self) -> UiTree {
-        // Traversiere GPUI Element Tree
-        // Sammle Bounds, Properties, etc.
-    }
-    
-    fn click_element(&self, event: &ClickEvent) -> bool {
-        // Dispatche MouseDown/MouseUp
-    }
-    
-    // ... weitere Methods
-}
+   gpui-component names that same git source for gpui, so the two resolve to
+   **one** gpui. A second copy (a path dependency next to the git one, or
+   upstream gpui from crates.io) makes every type mismatch.
 
-// 2. Starte IPC Server beim App-Start
-#[tokio::main]
-async fn main() {
-    let app_interface = Box::new(MyGpuiApp::new());
-    let app_handle = Arc::new(Mutex::new(app_interface));
-    
-    let ipc_server = GpuiIpcServer::new(
-        "/tmp/gpui-mcp.sock".to_string(),
-        app_handle
-    );
-    
-    tokio::spawn(async move {
-        ipc_server.start().await.unwrap();
-    });
-    
-    // Normale GPUI App
-    App::new().run(|cx| {
-        // ...
-    });
-}
+2. Start the in-app server once, after `gpui_component::init`:
+
+   ```rust
+   app.run(|cx| {
+       gpui_component::init(cx);
+       #[cfg(feature = "mcp")]
+       {
+           // The name is how the server finds this app among others.
+           gpui_component::mcp::init_mcp(cx, "my-app");
+           // Optional: whatever `get_app_state` should report for your app.
+           gpui_component::mcp::mcp_set_app_state_provider(|cx| {
+               serde_json::json!({ "rows": 0, "selected": null })
+           });
+       }
+       // ... windows, views ...
+   });
+   ```
+
+   `init_mcp` binds `{temp_dir}/gpui-mcp-my-app-{pid}.sock` and spawns the
+   listener thread. Requests are executed on gpui's main thread, so they see
+   consistent state and can dispatch real input.
+   `gpui_component::mcp::mcp_log(..)` appends to the 500-entry buffer that
+   `get_logs` returns.
+
+3. Build with the feature for development (`cargo build --features mcp`) and
+   without it for release.
+
+## Registering the server with an agent
+
+**Claude Code** — one command per project, run inside the app's checkout.
+`GPUI_MCP_APP` is the name you passed to `init_mcp`:
+
+```sh
+claude mcp add --transport stdio gpui-inspector --env GPUI_MCP_APP=my-app -- /abs/path/to/gpui-mcp-server
 ```
 
-### 3. Claude Desktop konfigurieren
+The default scope `local` records it privately for this project; `-s project`
+writes a `.mcp.json` into the repo for everyone who checks it out; `-s user`
+makes it global (then leave `GPUI_MCP_APP` out and let discovery pick the
+newest running app). `claude mcp get gpui-inspector` shows the status —
+"Connected" needs a running app with `init_mcp`; a Claude Code session that
+was already open must be restarted before the `mcp__gpui-inspector__*` tools
+appear.
 
-Füge zu deiner Claude Desktop Config hinzu (`~/Library/Application Support/Claude/claude_desktop_config.json` auf macOS):
+**Claude Desktop** — add to `claude_desktop_config.json`
+(macOS `~/Library/Application Support/Claude/`, Linux `~/.config/Claude/`,
+Windows `%APPDATA%\Claude\`):
 
 ```json
 {
   "mcpServers": {
     "gpui-inspector": {
-      "command": "/pfad/zu/gpui-mcp-server",
-      "env": {
-        "GPUI_MCP_SOCKET": "/tmp/gpui-mcp.sock"
-      }
+      "command": "/abs/path/to/gpui-mcp-server",
+      "env": { "GPUI_MCP_APP": "my-app" }
     }
   }
 }
 ```
 
-### 4. Starten
+### Which app does the server talk to?
 
-1. Starte deine GPUI App (die den IPC Server enthält)
-2. Starte Claude Desktop
-3. Claude hat jetzt Zugriff auf die Tools!
+| environment | behaviour |
+|---|---|
+| `GPUI_MCP_APP` + `GPUI_MCP_PID` | exactly `{temp_dir}/gpui-mcp-{app}-{pid}.sock`, no discovery |
+| `GPUI_MCP_APP` only | the newest running instance of that app |
+| neither | the newest GPUI app found; a warning on stderr when there is more than one |
 
-## Beispiel-Session
+Discovery scans the OS temp directory for `gpui-mcp-*.sock`, probes each, and
+deletes the ones nothing listens on (left behind by a crashed app).
 
-**Du:** "Inspiziere mal die UI von Elane"
+## The tools
 
-**Claude:** 
-```
-[verwendet inspect_ui_tree tool]
+| tool | what it does |
+|---|---|
+| `get_windows` | open windows with id, title, bounds, active flag — the window ids the other tools take |
+| `get_app_state` | window overview plus whatever the app's state provider returns (`app` key) |
+| `inspect_ui_tree` | the element hierarchy: id, type (from the source file), bounds, `source_location`, children, text. Filters: `max_depth`, `window_id`, `root_element_id`, `element_type_filter`, `text_filter`, `format: compact` |
+| `get_element` | one element with its full subtree |
+| `get_focus_info` | focused element and the active key-context chain — the first thing to check when a key binding does not fire |
+| `list_actions` | the app's gpui actions; `include_bindings` adds key bindings and docs, `only_available` keeps those whose context predicate matches the current focus |
+| `execute_action` | dispatch a named action through the focus chain, as a keystroke would |
+| `send_key` | one keystroke in gpui's notation (`enter`, `pagedown`, `f5`; modifiers as flags) |
+| `type_text` | a string, one keystroke per character |
+| `click_element` | left/right/middle click at an element's centre or at window pixel coordinates |
+| `take_screenshot` | the window (or one element, cropped) rendered to PNG |
+| `get_logs` | the in-app log buffer (≤500 lines) |
 
-Die UI hat folgende Struktur:
-- Root Window (1920x1080)
-  - Left Panel (300px breit)
-    - File List
-    - 156 Items sichtbar
-  - Right Panel (1620px breit)
-    - Content View
-    - ...
-```
+Every input tool (`send_key`, `type_text`, `click_element`, `execute_action`)
+returns the app state and focus info *after* the event was dispatched, so the
+agent usually sees the effect without a second round trip. The app's own
+debounce or async work may not have finished yet — read `get_app_state` again
+if a value looks stale.
 
-**Du:** "Mach mal einen Screenshot vom linken Panel mit Highlight"
+**Element ids** come in three forms, all accepted wherever an id is taken: the
+full id (`WindowId(1)/view-1.panel[0]`), the global id (`view-1.panel`), or a
+suffix (`panel`) — the first match wins. Give the elements you want to target
+stable ids in the app (`div().id("results")`).
 
-**Claude:**
-```
-[verwendet take_screenshot mit highlight_elements]
-[zeigt Screenshot]
-```
+## Platform notes
 
-**Du:** "Click auf das 3. Item in der Liste"
+- **Windows:** the socket is a `uds_windows` AF_UNIX socket in `%TEMP%`; the
+  server and the app must run as the same user. Building needs what gpui
+  needs anyway (Windows SDK, DirectX).
+- **Linux/macOS:** a plain `std::os::unix::net` socket in `$TMPDIR` (or
+  `/tmp`).
+- Screenshots are rendered by gpui itself (`render_to_image`, no screen
+  capture), so they work on an overlapped window and need no accessibility
+  permission.
 
-**Claude:**
-```
-[verwendet get_element um Position zu finden]
-[verwendet click_element]
-Erledigt!
-```
+## Troubleshooting
 
-## Entwicklung
+- *"No GPUI app found"* — the app is not running, was built without the
+  feature, or its `init_mcp` did not run. The app prints
+  `[MCP] IPC Server listening on …` to stderr when it did.
+- *Tools do not appear in Claude Code* — restart the session after
+  `claude mcp add`; check `claude mcp get gpui-inspector`.
+- *Keys reach the wrong element* — `get_focus_info` shows the focus chain and
+  key contexts. When an editor keeps focus, bind the list keys in the input's
+  context too (gpui gives the later binding precedence).
+- Server-side diagnostics go to stderr, which the agent client usually logs;
+  `GPUI_MCP_APP=… gpui-mcp-server < /dev/null` shows discovery output directly.
 
-### Tests laufen lassen
+## Security
 
-```bash
-cargo test
-```
+The in-app server gives anything that can reach the socket full control of
+the UI and a view of its state. It is a development tool: keep it behind a
+feature flag, never enable it in a shipped build, and remember the socket
+lives in a per-user temp directory but is not otherwise authenticated.
 
-### Beispiel Integration ansehen
+## Developing
 
-```bash
+```sh
+cargo test                 # protocol + socket-name parsing
 cargo run --example gpui_integration
 ```
 
-### Debugging
+`IMPLEMENTATION.md` holds the design notes (main-thread dispatch, how the flat
+inspector list becomes a tree, the screenshot path). An app using it today:
+[speedy](https://github.com/stefan-siebert/speedy) — `speedy-gui-gpui`, built
+with `cargo xtask gui-gpui`.
 
-Der MCP Server schreibt Debug-Output nach stderr:
+## License
 
-```bash
-# In Claude Desktop Config:
-"command": "/pfad/zu/gpui-mcp-server 2>/tmp/mcp-debug.log"
-```
-
-## IPC Protocol Details
-
-Kommunikation über Unix Domain Socket (`/tmp/gpui-mcp.sock` per Default).
-
-**Request Format:**
-```json
-{
-  "id": "uuid",
-  "method": "inspect_ui_tree",
-  "params": {}
-}
-```
-
-**Response Format:**
-```json
-{
-  "id": "uuid",
-  "result": {
-    "Ok": { /* data */ }
-  }
-}
-```
-
-Bei Fehler:
-```json
-{
-  "id": "uuid",
-  "result": {
-    "Err": "error message"
-  }
-}
-```
-
-## Performance
-
-- Socket-Verbindung wird für jeden Request neu aufgebaut (stateless)
-- UI Tree Traversierung sollte gecached werden wenn möglich
-- Screenshots sind teuer - nur bei Bedarf
-
-## Sicherheit
-
-⚠️ **WICHTIG**: Dieser MCP Server gibt Claude vollen Zugriff auf deine App!
-
-- Nur lokal verwenden (Unix Socket)
-- Nicht in Produktions-Builds aktivieren
-- Socket-File sollte nur für deinen User lesbar sein
-
-## Todo / Ideen
-
-- [ ] Screenshots tatsächlich implementieren (PNG encoding)
-- [ ] Element-Highlighting im Screenshot
-- [ ] Performance-Profiling
-- [ ] Cached UI Tree für bessere Performance
-- [ ] WebSocket alternative zu Unix Socket (für Remote Debugging)
-- [ ] Replay-Funktion für Test-Automation
-- [ ] Integration mit GPUI's eigenen Debugging Tools
-
-## Lizenz
-
-MIT oder Apache 2.0 (wie du möchtest)
+Intended MIT OR Apache-2.0; LICENSE files are not in the repo yet.
