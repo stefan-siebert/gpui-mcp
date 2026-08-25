@@ -121,7 +121,28 @@ Tab filling it in themselves. Duplicate `test_id`s within a window should be
 reported: the snapshot already prints them, and two elements called `#item`
 are only useful because the refs beside them are not.
 
-## Stage 3 — Record and replay
+## Stage 3 — Record and replay — **3a done**
+
+Shipped, in the server only — no app change and no wire change:
+
+- `GPUI_MCP_RECORD=<path>` writes every successful tool call to a script.
+  Steps are the same `{method, params}` shape a `batch` takes.
+- A `@ref` is rewritten into the id the snapshot printed beside it. Where there
+  was none, or where the id appears on more than one line, the ref is kept and
+  the step carries a note: rewriting `#item` when forty lines say `#item` would
+  produce a script that replays cleanly and clicks the wrong thing.
+- `replay_script { path, seek, stop_on_error }` for the agent, and
+  `gpui-mcp-server replay <file> [--seek] [--keep-going]` for CI, which exits
+  non-zero on failure.
+- No assertion step: a `wait_for` that comes back unsatisfied is a failed
+  assertion and already says which condition did not hold.
+
+Open (3b): a pinned window size, golden-screenshot comparison with a
+perceptual tolerance, and a defined starting state via an app-side reset hook.
+Recording input a *person* performs by hand would need the app side too; the
+server only sees what passes through it.
+
+The original sketch below is kept for the parts not built yet.
 
 Record **semantically**, never as coordinates: at record time each real user
 event (hand-driven too, not just MCP-driven) is resolved against the registry

@@ -30,6 +30,9 @@ MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJS
   forwards each tool call as one IPC request on a fresh connection.
 - `src/protocol.rs` — `IpcRequest`/`IpcResponse`, `UiElement`, param structs,
   `methods::*` constants. Tool names == IPC method names.
+- `src/script.rs` — recording a session to a file and replaying it, plus the
+  command-line `replay` mode. Server-local: a script is a list of tool calls,
+  so nothing about it reaches the app.
 - `src/docs.rs` — what the server tells an agent about itself: the
   `initialize` instructions, the `gpui_guide` tool, the guide resources and the
   `onboard` prompt, all generated from one topic table. Server-local: no IPC

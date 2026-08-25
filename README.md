@@ -157,6 +157,7 @@ Windows `%APPDATA%\Claude\`):
 | `GPUI_MCP_APP` + `GPUI_MCP_PID` | exactly `{temp_dir}/gpui-mcp-{app}-{pid}.sock`, no discovery |
 | `GPUI_MCP_APP` only | the newest running instance of that app |
 | neither | the newest GPUI app found; a warning on stderr when there is more than one |
+| `GPUI_MCP_RECORD` | additionally: write every successful tool call to this script file — see [Recording and replay](#recording-and-replay) |
 
 Discovery scans the OS temp directory for `gpui-mcp-*.sock`, probes each, and
 deletes the ones nothing listens on (left behind by a crashed app).
@@ -181,6 +182,7 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `batch` | several tools in one call, in order, with one state snapshot at the end — the way to spend one turn instead of four |
 | `take_screenshot` | the window (or one element, cropped) rendered to PNG, downscaled to 1400px wide unless `max_width` says otherwise |
 | `get_logs` | the in-app log buffer (≤500 lines) |
+| `replay_script` | replay a recorded session — to reach a state (`seek`), or as a test |
 
 Every input tool (`send_key`, `type_text`, `click_element`, `execute_action`)
 waits for the frame that shows what it changed, then appends the app state and
@@ -247,6 +249,64 @@ generated from one table in `src/docs.rs`:
 
 A test asserts that every method in `methods::ALL` appears in the `tools`
 topic, so a new tool cannot ship undocumented.
+
+## Recording and replay
+
+Start the server with `GPUI_MCP_RECORD` set and every successful tool call is
+written to that file as a script:
+
+```sh
+claude mcp add --transport stdio gpui-inspector \
+  --env GPUI_MCP_APP=my-app --env GPUI_MCP_RECORD=tests/open-file.json \
+  -- /abs/path/to/gpui-mcp-server
+```
+
+```json
+{
+  "name": "open-file",
+  "app": "my-app",
+  "steps": [
+    { "method": "click_element", "params": { "element_id": "open-file" } },
+    { "method": "type_text", "params": { "text": "src/main.rs" } },
+    { "method": "send_key", "params": { "key": "enter" } },
+    { "method": "wait_for", "params": { "text": "main.rs", "timeout_ms": 5000 } }
+  ]
+}
+```
+
+Steps are the same `{method, params}` shape `batch` takes, so a script can be
+written by hand as easily as recorded. Failed calls are not recorded — a script
+of things that did not work replays nothing — and the file is rewritten after
+each step, so an interrupted session still leaves valid JSON.
+
+**A `@ref` is rewritten into the id the snapshot printed beside it**, because a
+ref means "line seven of what I am looking at" and that is meaningless in a
+file. Where there was no id, or an id like `#item` that appeared on several
+lines, the ref is kept and the step carries a `note` saying it will only replay
+if the preceding snapshot produces the same lines. The fix is in the app: give
+that element its own id.
+
+Replaying the file does two different jobs:
+
+```sh
+gpui-mcp-server replay tests/open-file.json          # as a test, exits non-zero on failure
+gpui-mcp-server replay tests/open-file.json --seek   # just get back to that state
+```
+
+The agent can do the same through the `replay_script` tool. There is no
+assertion step and there does not need to be one: a `wait_for` that comes back
+unsatisfied **is** a failed assertion, and it already reports which condition
+did not hold.
+
+```
+  1  passed   click_element
+  2  failed   wait_for — waited 310 ms and the condition never held: {"text":{"found":false,"query":"Saved"}}
+
+open-file: 1 passed, 1 failed, 0 skipped, of 4
+```
+
+Which makes the CLI form the interesting one: the file an agent produced by
+exploring runs in CI afterwards, with no agent and no model cost.
 
 ## Platform notes
 

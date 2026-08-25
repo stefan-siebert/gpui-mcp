@@ -225,3 +225,51 @@ catch. `ui_snapshot` arrived without a bump, by the same rule.
   every hitbox, which is quadratic — but it lives in the gpui fork, not here.
   `build_element_tree` was the quadratic loop on this side, and that one is
   fixed.
+
+## Recording and replay
+
+A session is already a sequence of steps; writing it down costs nothing. The
+file then does two jobs that would otherwise need two mechanisms: it puts the
+app back where the work was, and it is a regression test that runs without an
+agent.
+
+Three decisions make it small.
+
+**A script's steps are `batch` steps.** There was no reason to invent a second
+shape for "a tool and its arguments", and reusing the first one means a script
+can be written by hand as easily as recorded, and pasted into a `batch`.
+
+**`wait_for` is the assertion.** A wait that comes back unsatisfied is a failed
+expectation, and it already reports which of its conditions did not hold. So
+replay needs no assertion step, no matcher vocabulary, and no second way to say
+what should be true. Adding one would have been the obvious design and the
+wrong one.
+
+**Recording lives in the server.** No app change, no wire change, and it works
+for any app the server can reach. The cost is that the server only sees what
+passes through it — which is everything an agent does, and nothing a person
+does by hand at the keyboard. Recording real user input would have to happen in
+the app; it is not needed for the two jobs above.
+
+### Refs have to be rewritten, and sometimes cannot be
+
+`@e7` means "line seven of the snapshot I am looking at". In a file that is a
+number, not an intention. So the recorder reads the snapshot text it just
+produced, and where a line carried an id it writes the id down instead of the
+ref.
+
+Where it could not — no id on that line, or an id like `#item` that appears on
+forty of them — it keeps the ref and attaches a note. Rewriting an ambiguous id
+would be worse than useless: `#item` suffix-matches the *first* item, so the
+script would replay cleanly and click the wrong thing. A script that admits it
+is fragile beats one that lies.
+
+That failure mode is also the strongest argument for giving elements explicit
+ids in the app, which is the same thing the snapshot has been asking for.
+
+### What replay does not do yet
+
+The plan lists three things a test suite eventually needs and this does not
+have: a pinned window size (layout, and therefore any golden image, depends on
+it), golden-screenshot comparison with a perceptual tolerance, and a defined
+starting state via an app-side reset hook. All three are additive.

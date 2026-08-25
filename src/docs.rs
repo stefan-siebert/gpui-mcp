@@ -53,8 +53,11 @@ that, and is what `wait_for` is for.
 
 Keystroke not arriving? `get_focus_info` first, then `list_actions {\"only_available\":true}`.
 
+A session can be recorded (`GPUI_MCP_RECORD`) and replayed with `replay_script` — the fastest way \
+back to a state you were working in.
+
 Full examples: call `gpui_guide` (topics: overview, tools, recipes, ids, focus, screenshots, \
-troubleshooting).";
+recording, troubleshooting).";
 
 /// One documentation topic.
 pub struct Topic {
@@ -97,6 +100,11 @@ pub const TOPICS: &[Topic] = &[
         name: "screenshots",
         summary: "Seeing the UI without drowning the context in pixels",
         body: SCREENSHOTS,
+    },
+    Topic {
+        name: "recording",
+        summary: "Recording a session and replaying it — to get back to a state, or as a test",
+        body: RECORDING,
     },
     Topic {
         name: "troubleshooting",
@@ -297,6 +305,13 @@ it performs, so this shows what actually happened on the app side.
 **`gpui_guide`** — `{"topic": "recipes"}`
 This documentation. Answered by the server itself, so it works even when no
 app is running.
+
+**`replay_script`** — `{"path": "tests/open-file.json", "seek": true}`
+Replay a recorded session. `seek: true` skips the read-only steps and just
+puts the app back where the work was; the default runs everything as a test,
+where a `wait_for` that comes back unsatisfied is a failed assertion. Recording
+is switched on by starting the server with `GPUI_MCP_RECORD=<path>`. See the
+`recording` topic.
 "#;
 
 const RECIPES: &str = r#"# Recipes
@@ -569,6 +584,89 @@ intended" — questions the element tree cannot answer.
 Values, state and structure. `get_app_state` and a filtered `inspect_ui_tree`
 answer those precisely, in a fraction of the tokens, and without you having to
 read pixels.
+"#;
+
+const RECORDING: &str = r#"# Recording and replaying a session
+
+A session driving an app is a sequence of steps. Written to a file it becomes
+two useful things at once: a way to put the app back where the work is, and a
+regression test that runs without an agent.
+
+## Recording
+
+The server records when it is started with `GPUI_MCP_RECORD` set to a path:
+
+```
+GPUI_MCP_RECORD=tests/open-file.json
+```
+
+Every successful tool call is appended. Failed calls are not: a script of
+things that did not work replays nothing. The file is rewritten after each
+step, so an interrupted session still leaves valid JSON behind.
+
+You do not do anything special while recording. Drive the app as usual.
+
+## What a script looks like
+
+```json
+{
+  "name": "open-file",
+  "app": "my-app",
+  "steps": [
+    { "method": "ui_snapshot", "params": { "interactive_only": true } },
+    { "method": "click_element", "params": { "element_id": "open-file" } },
+    { "method": "type_text", "params": { "text": "src/main.rs" } },
+    { "method": "send_key", "params": { "key": "enter" } },
+    { "method": "wait_for", "params": { "text": "main.rs", "timeout_ms": 5000 } }
+  ]
+}
+```
+
+Steps are the same `{method, params}` shape a `batch` takes. You can write one
+by hand, and you should edit a recorded one: drop the steps that were you
+looking around, and add `wait_for` steps where the app does something
+asynchronous.
+
+## Replaying
+
+```json
+{"name": "replay_script", "arguments": {"path": "tests/open-file.json", "seek": true}}
+```
+
+- `seek: true` skips the steps that only read — the tree, the screenshots —
+  and runs the rest. Use it at the start of a session to reach the state you
+  were working in, instead of clicking your way back there.
+- `seek: false` (the default) runs everything as a test.
+
+There is no separate assertion step, because there does not need to be one: a
+`wait_for` that comes back unsatisfied **is** a failed assertion, and its
+answer already says which condition did not hold. So the same file reaches a
+state and tests reaching it.
+
+## Refs are rewritten, when they can be
+
+A `@ref` means "line seven of the snapshot I am looking at", which is
+meaningless in a file. When the snapshot printed an id beside it, the recorder
+writes the id down instead:
+
+```
+- button "Save" #save-button @e6      →  "element_id": "save-button"
+```
+
+When it did not — no id, or an id like `#item` that appears on several lines —
+the ref is kept as written and the step carries a `note` saying so. Such a step
+only replays correctly if the snapshot before it produces the same lines. The
+fix is in the app: give that element its own id.
+
+## In CI, without an agent
+
+```sh
+gpui-mcp-server replay tests/open-file.json
+```
+
+Prints a line per step and exits non-zero if any failed. `--seek` and
+`--keep-going` work as above. That is the point of recording: the file an
+agent produced by exploring costs nothing to run again.
 "#;
 
 const TROUBLESHOOTING: &str = r#"# Errors and what they mean

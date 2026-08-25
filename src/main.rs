@@ -12,6 +12,9 @@ use uds_windows::UnixStream;
 use gpui_mcp_protocol::protocol::*;
 
 mod docs;
+mod script;
+
+use script::{Recorder, ReplayOptions, Script};
 
 /// MCP Server for GPUI inspection and automation.
 ///
@@ -369,6 +372,51 @@ fn snapshot_text(tool_name: &str, content: &serde_json::Value) -> Option<String>
     Some(format!("{header}\n{snapshot}"))
 }
 
+/// Name of the tool that replays a recorded script. Server-local, like the
+/// guide: it drives the app through the other tools rather than being one of
+/// them.
+const REPLAY_TOOL: &str = "replay_script";
+
+/// Replay a script file, forwarding each of its steps.
+///
+/// There is no separate assertion step: a `wait_for` that comes back
+/// unsatisfied is a failed assertion, and already says which condition did not
+/// hold. So the same file both reaches a state and tests reaching it.
+fn replay_result(
+    server: &GpuiMcpServer,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let path = arguments
+        .get("path")
+        .and_then(|path| path.as_str())
+        .ok_or_else(|| anyhow::anyhow!("replay_script needs a `path` to a recorded script"))?;
+
+    let script = Script::read(std::path::Path::new(path))?;
+    let options = ReplayOptions {
+        seek: arguments
+            .get("seek")
+            .and_then(|seek| seek.as_bool())
+            .unwrap_or(false),
+        stop_on_error: arguments
+            .get("stop_on_error")
+            .and_then(|stop| stop.as_bool())
+            .unwrap_or(true),
+    };
+
+    let report = script::replay(&script, &options, |method, params| {
+        server
+            .handle_tool_call(method, params)
+            .map(|(value, _images)| value)
+    });
+
+    let mut result = serde_json::to_value(&report)?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("script".into(), json!(script.name));
+        object.insert("path".into(), json!(path));
+    }
+    Ok(result)
+}
+
 /// A successful JSON-RPC result.
 fn ok_response(id: serde_json::Value, result: serde_json::Value) -> McpResponse {
     McpResponse {
@@ -535,6 +583,28 @@ fn tools_list() -> serde_json::Value {
                         }
                     },
                     "required": []
+                }
+            },
+            {
+                "name": REPLAY_TOOL,
+                "description": "Replay a recorded script: a list of steps in the same shape a batch takes, saved to a file. Two uses from one file. seek=true skips the read-only steps and just puts the app back where work happens — worth doing at the start of a session instead of clicking your way there again. seek=false runs everything as a test: a wait_for that comes back unsatisfied is a failed assertion and the report says which condition did not hold. Record a script by starting this server with GPUI_MCP_RECORD=path.json. Example: {\"path\": \"tests/open-file.json\", \"seek\": true}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the script file."
+                        },
+                        "seek": {
+                            "type": "boolean",
+                            "description": "Skip steps that only read (inspect_ui_tree, screenshots, …) and run the rest. Default: false, which replays everything as a test."
+                        },
+                        "stop_on_error": {
+                            "type": "boolean",
+                            "description": "Stop at the first failing step. Default: true — the steps after a failure act on a state nobody intended."
+                        }
+                    },
+                    "required": ["path"]
                 }
             },
             {
@@ -883,7 +953,103 @@ fn tools_list() -> serde_json::Value {
     })
 }
 
+/// What this binary prints when asked, and when told something it does not
+/// understand.
+const USAGE: &str = "\
+gpui-mcp-server — an MCP server for inspecting and driving a running GPUI app.
+
+  gpui-mcp-server                       speak MCP on stdin/stdout (what an
+                                        agent launches; the usual case)
+  gpui-mcp-server replay <script.json>  replay a recorded script and report
+      --seek                            skip the read-only steps: reach the
+                                        state, do not test the way there
+      --keep-going                      do not stop at the first failure
+  gpui-mcp-server --help
+
+Environment:
+  GPUI_MCP_APP      restrict discovery to one app name
+  GPUI_MCP_PID      with GPUI_MCP_APP: one exact instance, no discovery
+  GPUI_MCP_RECORD   write every successful tool call to this script file
+";
+
+/// The command-line side.
+///
+/// Replaying without an agent is what makes a recording usable in CI: the same
+/// file an agent produced by exploring becomes a test that costs no model
+/// tokens to run.
+fn run_command(arguments: &[String]) -> Result<()> {
+    match arguments[0].as_str() {
+        "--help" | "-h" | "help" => {
+            print!("{USAGE}");
+            Ok(())
+        }
+        "replay" => run_replay(&arguments[1..]),
+        other => {
+            eprintln!("Unknown command: {other}\n");
+            eprint!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run_replay(arguments: &[String]) -> Result<()> {
+    let mut path: Option<&str> = None;
+    let mut options = ReplayOptions {
+        seek: false,
+        stop_on_error: true,
+    };
+
+    for argument in arguments {
+        match argument.as_str() {
+            "--seek" => options.seek = true,
+            "--keep-going" => options.stop_on_error = false,
+            other if other.starts_with('-') => {
+                anyhow::bail!("Unknown option for replay: {other}");
+            }
+            other => path = Some(other),
+        }
+    }
+
+    let path = path.ok_or_else(|| anyhow::anyhow!("replay needs a script file"))?;
+    let script = Script::read(std::path::Path::new(path))?;
+    let server = GpuiMcpServer::new();
+
+    let report = script::replay(&script, &options, |method, params| {
+        server
+            .handle_tool_call(method, params)
+            .map(|(value, _images)| value)
+    });
+
+    for step in &report.steps {
+        match &step.detail {
+            Some(detail) => println!(
+                "{:>3}  {:<7}  {} — {}",
+                step.index + 1,
+                step.status,
+                step.method,
+                detail
+            ),
+            None => println!("{:>3}  {:<7}  {}", step.index + 1, step.status, step.method),
+        }
+    }
+
+    println!(
+        "\n{}: {} passed, {} failed, {} skipped, of {}",
+        script.name, report.passed, report.failed, report.skipped, report.of
+    );
+
+    if !report.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if !arguments.is_empty() {
+        return run_command(&arguments);
+    }
+
     let server = GpuiMcpServer::new();
 
     eprintln!("GPUI MCP Server starting...");
@@ -910,6 +1076,21 @@ fn main() -> Result<()> {
             );
         }
     }
+
+    // `GPUI_MCP_RECORD` turns the session into a script as it happens: an
+    // agent finding its way around an app is already writing the test, and
+    // the seek script that gets the next session there in one call.
+    let mut recorder = match std::env::var("GPUI_MCP_RECORD") {
+        Ok(path) if !path.trim().is_empty() => {
+            let recorder = Recorder::new(path.trim(), std::env::var("GPUI_MCP_APP").ok());
+            eprintln!(
+                "[MCP] Recording this session to {}",
+                recorder.path().display()
+            );
+            Some(recorder)
+        }
+        _ => None,
+    };
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -1003,12 +1184,55 @@ fn main() -> Result<()> {
                     continue;
                 }
 
+                // Replay drives the app through the other tools rather than
+                // being one of them, so it is answered here too.
+                if tool_name == REPLAY_TOOL {
+                    let response = match replay_result(&server, &arguments) {
+                        Ok(report) => ok_response(
+                            id,
+                            json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string_pretty(&report)?,
+                                }]
+                            }),
+                        ),
+                        Err(error) => ok_response(
+                            id,
+                            json!({
+                                "content": [{ "type": "text", "text": format!("Error: {error}") }],
+                                "isError": true,
+                            }),
+                        ),
+                    };
+                    send_response(&mut stdout, &response)?;
+                    continue;
+                }
+
+                let recorded_arguments = arguments.clone();
+
                 let response = match server.handle_tool_call(tool_name, arguments) {
                     Ok((content, images)) => {
                         let text = match snapshot_text(tool_name, &content) {
                             Some(text) => text,
                             None => serde_json::to_string_pretty(&content)?,
                         };
+                        // Only successful calls are worth recording: a script
+                        // of things that did not work replays nothing.
+                        if let Some(recorder) = recorder.as_mut() {
+                            let snapshot =
+                                (tool_name == methods::UI_SNAPSHOT).then_some(text.as_str());
+                            if let Err(error) =
+                                recorder.record(tool_name, &recorded_arguments, snapshot)
+                            {
+                                eprintln!(
+                                    "[MCP] Could not write {}: {}",
+                                    recorder.path().display(),
+                                    error
+                                );
+                            }
+                        }
+
                         let mut blocks = vec![json!({ "type": "text", "text": text })];
                         // One image for a screenshot, possibly several from a
                         // batch that took more than one.
@@ -1114,6 +1338,14 @@ fn main() -> Result<()> {
         }
     }
 
+    if let Some(recorder) = &recorder {
+        eprintln!(
+            "[MCP] Recorded {} steps to {}",
+            recorder.steps(),
+            recorder.path().display()
+        );
+    }
+
     Ok(())
 }
 
@@ -1129,8 +1361,12 @@ mod tests {
         assert_eq!(tools[0]["name"], docs::TOOL_NAME);
         assert_eq!(
             tools.len(),
-            methods::ALL.len() + 1,
-            "every IPC method plus the guide"
+            methods::ALL.len() + 2,
+            "every IPC method plus the two the server answers itself"
+        );
+        assert!(
+            tools.iter().any(|tool| tool["name"] == REPLAY_TOOL),
+            "replay is not advertised"
         );
         for method in methods::ALL {
             assert!(
@@ -1251,10 +1487,44 @@ mod tests {
     }
 
     /// `handle_tool_call` forwards over the socket; the guide must never get
-    /// that far, or it would fail exactly when it is needed most.
+    /// that far, or it would fail exactly when it is needed most. Replay is
+    /// server-local for a different reason: it drives the app *through* the
+    /// other tools rather than being one of them.
     #[test]
-    fn the_guide_is_not_an_ipc_method() {
+    fn the_server_local_tools_are_not_ipc_methods() {
         assert!(!methods::ALL.contains(&docs::TOOL_NAME));
+        assert!(!methods::ALL.contains(&REPLAY_TOOL));
+    }
+
+    /// A replay that recorded itself would grow without end.
+    #[test]
+    fn the_server_local_tools_are_never_recorded() {
+        assert!(script::NOT_RECORDED.contains(&docs::TOOL_NAME));
+        assert!(script::NOT_RECORDED.contains(&REPLAY_TOOL));
+    }
+
+    #[test]
+    fn replay_needs_a_path() {
+        let server = GpuiMcpServer::new();
+        let error = replay_result(&server, &json!({})).expect_err("no path");
+        assert!(error.to_string().contains("path"), "{error}");
+    }
+
+    #[test]
+    fn replay_says_when_the_script_is_not_one() {
+        let server = GpuiMcpServer::new();
+        let path =
+            std::env::temp_dir().join(format!("gpui-mcp-not-a-script-{}.json", std::process::id()));
+        std::fs::write(&path, "{\"nope\": true}").unwrap();
+
+        let error = replay_result(&server, &json!({ "path": path.to_string_lossy() }))
+            .expect_err("not a script");
+        assert!(
+            error.to_string().contains("not a gpui-mcp script"),
+            "{error}"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
