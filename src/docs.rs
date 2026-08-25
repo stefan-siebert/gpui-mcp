@@ -34,17 +34,18 @@ pub const INSTRUCTIONS: &str = "\
 gpui-mcp drives a running GPUI app: read the element tree, click, type, press keys, dispatch \
 named actions, take screenshots.
 
-Start: (1) `get_windows` for the window ids every other tool takes — all of them default to the \
-active window. (2) `inspect_ui_tree {\"max_depth\":3,\"format\":\"compact\"}` to orient yourself; \
-never call it unfiltered on a large app. (3) drive it, preferring `execute_action` over `send_key` \
-over `click_element` — actions are named, stable and independent of layout.
+Start: (1) `ui_snapshot` — one short line per meaningful element, each ending in a `@ref` you can \
+act on. This is the cheap way to see a window; `inspect_ui_tree` is for layout questions and is \
+huge unfiltered. (2) `get_windows` when you need window ids; every tool defaults to the active \
+window. (3) drive it, preferring `execute_action` over `send_key` over `click_element` — actions \
+are named, stable and independent of layout.
 
 Spend calls, not turns. `batch` runs several tools in one call and `wait_for` waits inside the app \
 until a condition holds, so click, type, enter, wait is ONE call rather than four. Never poll by \
 calling a read tool in a loop.
 
-Element ids come in three forms, accepted wherever an id is taken: full \
-(`WindowId(1)/view-1.panel[0]`), global (`view-1.panel`), or a suffix (`panel`, first match wins).
+Element ids: a `@ref` from the last snapshot, or the full id, the global id, or a suffix of it \
+(first match wins). All four work wherever an id is taken.
 
 Input tools answer only once the frame showing their effect has been painted, so the state they \
 return is current. Work the app starts on its own — an async load, a debounce — is not covered by \
@@ -168,9 +169,11 @@ painted, and the `app_state` and `focus_info` they carry describe that frame.
 What they cannot cover is work the app starts on its own — an async load, a
 debounce, an animation. For that, `wait_for` is the answer, not a second look.
 
-**`inspect_ui_tree` without filters can be enormous.** Always pass at least
-`max_depth` or `format: "compact"`, and prefer `text_filter` / `root_element_id`
-once you know what you are looking for.
+**`inspect_ui_tree` without filters can be enormous** — tens of thousands of
+tokens on a real UI. Use `ui_snapshot` for "what is on screen"; reach for the
+tree when the question is about layout, and then pass at least `max_depth` or
+`format: "compact"`, and prefer `text_filter` / `root_element_id` once you know
+what you are looking for.
 
 **`element_type` is a filename, not a widget class.** It is derived from the
 element's `source_location`, so an element rendered from `button.rs` has
@@ -194,6 +197,19 @@ defaults to the active window.
 **`get_windows`** — `{}`
 Returns `[{id, title, bounds:{x,y,width,height}, is_active}]`. The `id` looks
 like `"WindowId(1)"` and is what every other tool's `window_id` wants.
+
+**`ui_snapshot`** — `{}` or `{"interactive_only": true}`
+The window as a short list: one line per element that means something, layout
+scaffolding dropped and its children lifted in its place. Lines read
+`role "name" #test-id @ref`, indented by nesting. The role comes from the file
+that rendered the element, so gpui-component's own widgets name themselves;
+your app's widgets appear by their id and their text. Options: `filter`
+(role/name/test-id substring, ancestors kept), `interactive_only`,
+`root_element_id`, `max_elements` (default 200), `include_bounds`.
+
+Start here. On a real UI this is a small fraction of the tree's size, and the
+`@ref` at the end of each line works as `element_id` in `click_element`,
+`wait_for`, `get_element` and `take_screenshot`.
 
 **`inspect_ui_tree`** — `{"max_depth": 3, "format": "compact"}`
 The element hierarchy. Options: `max_depth` (0 = unlimited), `window_id`,
@@ -316,16 +332,34 @@ Then narrow to the part you changed and compare it against what you intended:
 {"name": "take_screenshot", "arguments": {"element_id": "sidebar"}}
 ```
 
+## See what is on screen
+
+```json
+{"name": "ui_snapshot", "arguments": {}}
+```
+```
+ui_snapshot 4 — WindowId(1v1), 47 of 318 painted elements
+- banner #title-bar @e1
+- menu #gallery-sidebar @e2
+  - listitem "Accordion" #item @e3
+  - listitem "Alert" #item @e4
+- group #gallery-container @e5
+  - button "Save" #save-button @e6
+  - textbox #search @e7
+```
+Narrow it when the window is busy: `{"interactive_only": true}` for what can be
+clicked, `{"filter": "save"}` for one thing, `{"root_element_id": "@e5"}` for
+one region.
+
 ## Press a button whose label you know
 
 ```json
-{"name": "inspect_ui_tree", "arguments": {"text_filter": "Save", "format": "compact"}}
+{"name": "ui_snapshot", "arguments": {"filter": "save"}}
+{"name": "click_element", "arguments": {"element_id": "@e6"}}
 ```
-Take the `id` of the smallest element that contains the label, then:
-```json
-{"name": "click_element", "arguments": {"element_id": "<that id>"}}
-```
-If the app has an action for it, skip all of this and use `execute_action` —
+Refs come from the most recent snapshot and the next one replaces them; acting
+on a stale ref fails with a message saying so rather than hitting the wrong
+element. If the app has an action for the same thing, prefer `execute_action` —
 it survives layout changes, a click does not.
 
 ## Type into a field
@@ -413,15 +447,22 @@ describes an older frame.
 
 const IDS: &str = r#"# Element ids and element types
 
-## The three forms
+## The four forms
 
 Every tool that takes an element id accepts any of:
 
 | form | example | when to use |
 |---|---|---|
+| ref | `@e7` | from the last `ui_snapshot` — the one to reach for |
 | full | `WindowId(1)/view-1.panel[0]` | exactly what `inspect_ui_tree` returned — never ambiguous |
 | global | `view-1.panel` | stable across window ids |
 | suffix | `panel` | shortest; **the first match wins**, so check there is only one |
+
+A `@ref` is shorthand for "the thing on that line of the snapshot I just
+showed you". Each snapshot replaces the previous set, so a ref from an older
+one fails with a message telling you to take a new snapshot — it never
+silently resolves to whatever now sits on that line. An id copied out of
+`format: "compact"` output works too, instance suffix and all.
 
 The id path comes from GPUI's element ids: only elements the app gave an id
 (`div().id("results")`) appear as a named segment. Anonymous layout elements

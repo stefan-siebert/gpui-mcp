@@ -341,6 +341,34 @@ fn send_response(stdout: &mut impl Write, response: &McpResponse) -> Result<()> 
     Ok(())
 }
 
+/// Render a `ui_snapshot` answer as the text it already is.
+///
+/// Everything else is handed to the agent as pretty-printed JSON, which for a
+/// snapshot would be the worst of both worlds: every newline escaped, the
+/// indentation that carries the structure turned into `\n  ` noise, and the
+/// size roughly doubled for nothing. Returns `None` for any other tool.
+fn snapshot_text(tool_name: &str, content: &serde_json::Value) -> Option<String> {
+    if tool_name != methods::UI_SNAPSHOT {
+        return None;
+    }
+    let snapshot = content.get("snapshot")?.as_str()?;
+
+    let mut header = format!(
+        "ui_snapshot {} — {}, {} of {} painted elements",
+        content["snapshot_id"],
+        content["window_id"].as_str().unwrap_or("?"),
+        content["elements"],
+        content["painted_elements"],
+    );
+    if content["truncated"] == json!(true) {
+        header.push_str(
+            " (stopped early — raise max_elements, or narrow with filter / root_element_id)",
+        );
+    }
+
+    Some(format!("{header}\n{snapshot}"))
+}
+
 /// A successful JSON-RPC result.
 fn ok_response(id: serde_json::Value, result: serde_json::Value) -> McpResponse {
     McpResponse {
@@ -515,6 +543,40 @@ fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "ui_snapshot",
+                "description": "Read the window as a short, readable list: one line per element that means something, with the layout scaffolding left out. START HERE instead of inspect_ui_tree — on a real UI this is a fraction of the size and answers the question you actually have, which is what is on screen and what can be acted on. Every line ends with a @ref (@e7) that works as element_id in click_element, wait_for, get_element and take_screenshot; the next snapshot replaces them. Lines read: role \"name\" #test-id @ref. Example: {\"interactive_only\": true}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to snapshot (default: active window)"
+                        },
+                        "root_element_id": {
+                            "type": "string",
+                            "description": "Snapshot this element's subtree instead of the whole window. Takes an id or a @ref."
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "Keep only elements whose role, name or test id contains this (case-insensitive), plus the ancestors leading to them."
+                        },
+                        "interactive_only": {
+                            "type": "boolean",
+                            "description": "Keep only what you can act on — buttons, inputs, list items, tabs. The fastest way to answer 'what can I click here?'."
+                        },
+                        "max_elements": {
+                            "type": "integer",
+                            "description": "Stop after this many lines and say so. Default 200."
+                        },
+                        "include_bounds": {
+                            "type": "boolean",
+                            "description": "Add each element's bounds. Off by default — a snapshot is about structure, and coordinates are what make the tree expensive."
+                        }
+                    },
                     "required": []
                 }
             },
@@ -943,10 +1005,11 @@ fn main() -> Result<()> {
 
                 let response = match server.handle_tool_call(tool_name, arguments) {
                     Ok((content, images)) => {
-                        let mut blocks = vec![json!({
-                            "type": "text",
-                            "text": serde_json::to_string_pretty(&content)?,
-                        })];
+                        let text = match snapshot_text(tool_name, &content) {
+                            Some(text) => text,
+                            None => serde_json::to_string_pretty(&content)?,
+                        };
+                        let mut blocks = vec![json!({ "type": "text", "text": text })];
                         // One image for a screenshot, possibly several from a
                         // batch that took more than one.
                         for image in images {

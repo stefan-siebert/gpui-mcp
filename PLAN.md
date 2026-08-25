@@ -81,23 +81,45 @@ hitbox) and is left for a separate change to the fork.
 ## Stage 2 — Names: an accessibility layer as the addressing vocabulary
 
 Stable addressing and accessibility are the same feature, which is why they
-get built together. Two tiers:
+get built together. Two tiers.
 
-- **Durable: `test_id` + role/name.** An annotation in gpui-component
-  (`.a11y(Role::Button, "Open file")`, `.test_id("open-file")`) stored in a
-  per-frame side table keyed by `InspectorElementId`. gpui-component owns
-  Button, Input, Checkbox, List and Tab, so those fill role, name, value and
-  state (`checked`, `selected`, `disabled`, `expanded`) automatically — only
-  bespoke UI needs annotating by hand. Duplicate `test_id`s within a window
-  are reported as an error, which is what makes them actually unique.
-- **Ephemeral: `ref`.** Each snapshot hands out short handles (`e17`) plus a
-  generation number. Acting on a ref from an older generation fails with
-  "stale ref, take a new snapshot" instead of quietly hitting the wrong
-  element.
+### 2a — derived, no annotation — **done**
 
-`ui_snapshot` then returns one semantic line per element, layout-only divs
-omitted — typically 10–50× smaller than `inspect_ui_tree`, readable,
-addressable and assertable. The raw tree stays for layout debugging.
+The role was already in the data: an element's `source_location` names the
+file that rendered it, and for gpui-component's own widgets the file name *is*
+the role. `button/button.rs` renders a button. So every app on this crate gets
+a semantic vocabulary for nothing, and stage 2's payoff arrived without a
+single annotation.
+
+`ui_snapshot` prints one line per element that means something —
+`role "name" #test-id @ref` — and drops the layout scaffolding, lifting its
+children into its place. Measured on the story app: **3.4 KB against 151 KB**
+for the full tree and 63 KB for `format: "compact"` at depth 3;
+`interactive_only` answers "what can I click here" in 332 bytes. The server
+hands it back as text rather than JSON, since escaping the indentation would
+double it for nothing.
+
+Refs (`@e7`) are handed out per snapshot and the next snapshot replaces the
+whole set, so a stale one fails loudly instead of resolving to whatever now
+sits on that line. They work as `element_id` everywhere, including for a
+snapshot taken earlier in the same `batch`.
+
+Two rules keep the derivation honest: a region role (`banner`, `list`,
+`dialog`, …) is only used when the element contains something, because one
+file paints both a title bar and its close button; and an id segment counts as
+a `test_id` only when somebody clearly wrote it — lowercase, dashes or
+underscores — never `view-4294967734`, `1-0-0` or a type name.
+
+### 2b — annotated, for what cannot be derived — open
+
+A file name cannot say `checked`, `selected`, `disabled` or what an input
+currently holds, and an app's own widgets have no role at all. That needs an
+annotation in gpui-component — `.a11y(Role::Button, "Open file")`,
+`.test_id("open-file")` — recorded per frame and keyed by
+`InspectorElementId`, with gpui-component's Button, Input, Checkbox, List and
+Tab filling it in themselves. Duplicate `test_id`s within a window should be
+reported: the snapshot already prints them, and two elements called `#item`
+are only useful because the refs beside them are not.
 
 ## Stage 3 — Record and replay
 

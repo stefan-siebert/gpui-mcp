@@ -223,6 +223,7 @@ pub struct Modifiers {
 /// IPC method names. The MCP tool names are identical.
 pub mod methods {
     // Inspection
+    pub const UI_SNAPSHOT: &str = "ui_snapshot";
     pub const INSPECT_UI_TREE: &str = "inspect_ui_tree";
     pub const GET_ELEMENT: &str = "get_element";
     pub const GET_WINDOWS: &str = "get_windows";
@@ -245,6 +246,7 @@ pub mod methods {
     /// Every method, in the order the MCP server advertises its tools.
     pub const ALL: &[&str] = &[
         GET_WINDOWS,
+        UI_SNAPSHOT,
         INSPECT_UI_TREE,
         GET_ELEMENT,
         GET_FOCUS_INFO,
@@ -358,6 +360,40 @@ pub struct GetFocusInfoParams {
     #[serde(default)]
     pub window_id: Option<String>,
 }
+
+/// Params for [`methods::UI_SNAPSHOT`].
+///
+/// The snapshot is the cheap way to look at a UI: one line per element that
+/// means something, with the layout scaffolding left out. The full tree from
+/// [`methods::INSPECT_UI_TREE`] stays for layout debugging, where the bounds
+/// and source locations are the point.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiSnapshotParams {
+    #[serde(default)]
+    pub window_id: Option<String>,
+    /// Snapshot this element's subtree instead of the whole window.
+    #[serde(default)]
+    pub root_element_id: Option<String>,
+    /// Keep only elements whose role, name or test id contains this
+    /// (case-insensitive), along with their ancestors.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Keep only elements you can act on — buttons, inputs, list items and the
+    /// like.
+    #[serde(default)]
+    pub interactive_only: bool,
+    /// Stop after this many elements, saying so. Default
+    /// [`DEFAULT_SNAPSHOT_ELEMENTS`].
+    #[serde(default)]
+    pub max_elements: Option<usize>,
+    /// Add each element's bounds. Off by default: a snapshot is for structure,
+    /// and coordinates are what makes the tree expensive.
+    #[serde(default)]
+    pub include_bounds: bool,
+}
+
+/// How many elements a snapshot returns unless asked for more.
+pub const DEFAULT_SNAPSHOT_ELEMENTS: usize = 200;
 
 /// Params for [`methods::WAIT_FOR`].
 ///
