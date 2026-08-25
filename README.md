@@ -263,11 +263,14 @@ problems it can actually see:
 | `target-too-small` | warning | an interactive element with a side under `min_target_size`, 24px by default (WCAG 2.2) |
 | `zero-size-control` | serious | an interactive element painted with no area at all |
 
-Run against gpui-component's own story app it finds nine unnamed controls (all
-the icon-only buttons in the title bar, and the search field), that `#menu`
-names four buttons, and that `#item` names sixty-two list rows.
+A first run against a real desktop UI — the gpui-component gallery, an
+unmodified upstream demo used here as a test subject — reported nine unnamed
+controls (every icon-only button in the title bar, plus the search field),
+`#menu` naming four buttons and `#item` naming sixty-two list rows. That is
+what most UIs look like before anyone has had reason to name things, not a mark
+against that one.
 
-That last one is why this is not only an accessibility feature: a recorded
+The `#item` finding is why this is not only an accessibility feature: a recorded
 script targeting `#item` clicks the first of sixty-two, quietly, and only in
 the run where the order changed. **The same fix serves both readers** — give
 the element its own id and a label, and it becomes both announceable and

@@ -3,6 +3,66 @@
 Working document. The goal is not a faster socket — it is fewer agent turns,
 smaller payloads, and artefacts that double as tests.
 
+## State of play
+
+Stages 0, 1, 3a and 4 are shipped and verified against a running app. Stage 2
+is half done: the derived half (2a) shipped, the annotated half (2b) is blocked
+on a decision, below.
+
+| stage | what | state |
+|---|---|---|
+| 0 | the server documents itself to the agent | done |
+| 1 | frame-synchronous answers, `wait_for`, `batch` | done, protocol v2 |
+| 2a | `ui_snapshot`, roles derived from the source file, refs | done |
+| 2b | explicit `.a11y()` annotations: state, value, app-owned widgets | **blocked, needs a decision** |
+| 3a | recording a session, replaying it, the `replay` CLI | done |
+| 3b | pinned window size, golden screenshots, an app-side reset hook | open |
+| 4 | `a11y_audit`, and a failing audit failing a replay | done, minus what the derived layer cannot see |
+
+### The decision 2b is waiting on
+
+A generic `.a11y(...)` wrapper element **cannot** work: it receives its own
+`InspectorElementId`, whose path is built from its own source location, so it
+can never key a side table by the id of the `div` that registers the hitbox —
+and only elements with a hitbox appear in `inspector_elements()`.
+`with_inspector_state` does not help either; it only applies to the element the
+inspector is actively picking.
+
+So the annotation has to ride on the element that registers the hitbox, which
+means `Interactivity` in gpui — a change in the zed fork:
+
+1. fields on `Interactivity` plus a setter trait,
+2. carried through `insert_inspector_hitbox`,
+3. surfaced on `InspectorElementInfo`,
+4. then gpui-component's widgets fill them in.
+
+The cost is a larger delta against upstream zed, and therefore a heavier
+rebase. That is the call to make before 2b starts. Everything 2b would unlock —
+`checked`/`selected`/`disabled`, an input's value, roles for app-owned widgets,
+contrast, per-element focus — is blocked behind it.
+
+### Loose ends worth a look
+
+- An id like `#input-4294967299` carries an entity number that changes on every
+  app start, but looks hand-written to the `test_id` heuristic. A recorded
+  script targeting it breaks tomorrow. An `unstable-id` audit check — an id
+  ending in a long digit run — would catch the class.
+- Repeated ids are the most common real finding, and `duplicate-id` reports
+  them, but nothing yet reports them *at record time*, when the script is being
+  written.
+
+### Verifying a change by hand
+
+There is no app in this repo, so use gpui-component's gallery:
+
+```sh
+cd ../gpui-component && cargo run -p gpui-component-story --features mcp
+GPUI_MCP_APP=story ./target/release/gpui-mcp-server replay <script.json>
+```
+
+Both halves must be rebuilt together after a protocol change; the version
+handshake will say so if they are not.
+
 ## Why: where the time actually goes
 
 Measured against this repo's release binary and a temp dir with 488 entries:
@@ -189,8 +249,10 @@ this side), keyboard reachability and focus traps (focus is a `FocusHandle`,
 not an element), and anything about state. Contrast and state need stage 2b;
 focus needs a per-element focus id, which is the same fork change.
 
-Found on gpui-component's own story app the first time it ran: nine unnamed
-controls, `#menu` naming four buttons, `#item` naming sixty-two list rows.
+First run against the gpui-component gallery (upstream's demo, borrowed as a
+test subject): nine unnamed controls, `#menu` naming four buttons, `#item`
+naming sixty-two list rows. Evidence that the checks fire on a real UI — not a
+list of things anyone here owns.
 
 ## Order
 
