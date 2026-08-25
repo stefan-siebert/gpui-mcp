@@ -3,13 +3,31 @@
 Lets an AI agent (Claude Code, Claude Desktop, anything that speaks the
 [Model Context Protocol](https://modelcontextprotocol.io)) **look at and drive a
 running [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
-application**: read the element tree with bounds and source locations, see
-what has focus and which key contexts are active, type, press keys, click,
-dispatch named actions, take screenshots, and read an app-defined state
-snapshot. The agent verifies a GUI change the way a person would — by using
-the app — instead of guessing from the code or blind-firing `SendKeys`.
+application**: see what is on screen, click, type, press keys, dispatch named
+actions, take screenshots, wait for something to happen, and read an
+app-defined state snapshot. The agent checks a GUI change the way a person
+would — by using the app — instead of guessing from the code or blind-firing
+`SendKeys`.
+
+What it is built around: **a tool call costs the agent a model turn, seconds
+of it, while the socket underneath costs about a millisecond.** So the tools
+are shaped to spend as few turns as possible. `ui_snapshot` reads a window in
+a fraction of the tree's size, `wait_for` waits inside the app instead of
+having the agent look again and again, `batch` puts a whole interaction in one
+call, and an input does not answer until the frame showing its effect has been
+painted — so "did that work?" needs no second call.
 
 Works on Linux, macOS and Windows.
+
+## Where things are documented
+
+| for | read |
+|---|---|
+| using it | this file |
+| the agent, at runtime | the `gpui_guide` tool — the server documents itself, see [Getting an agent up to speed](#getting-an-agent-up-to-speed) |
+| why it is built this way | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the measurements, the frame contract, the decisions and what would break if one were undone |
+| what is coming | [PLAN.md](PLAN.md) |
+| putting it in an app | the *MCP Inspector* page in [gpui-component](https://github.com/stefan-siebert/gpui-component)'s docs |
 
 ## How it fits together
 
@@ -149,6 +167,7 @@ deletes the ones nothing listens on (left behind by a crashed app).
 |---|---|
 | `gpui_guide` | this server's own documentation — the three-step start, worked examples, how ids resolve, the traps. Answered by the server, so it works before the app runs |
 | `get_windows` | open windows with id, title, bounds, active flag — the window ids the other tools take |
+| `ui_snapshot` | the window as one short line per meaningful element — `role "name" #test-id @ref` — with the layout scaffolding dropped. Start here: on a real UI it is a fraction of the tree's size |
 | `get_app_state` | window overview plus whatever the app's state provider returns (`app` key) |
 | `inspect_ui_tree` | the element hierarchy: id, type (from the source file), bounds, `source_location`, children, text. Filters: `max_depth`, `window_id`, `root_element_id`, `element_type_filter`, `text_filter`, `format: compact` |
 | `get_element` | one element with its full subtree |
@@ -174,10 +193,37 @@ What this cannot cover is work the app starts on its own: an async load, a
 debounce, an animation. That is what `wait_for` is for, and it waits inside the
 app rather than costing the agent a call per look.
 
-**Element ids** come in three forms, all accepted wherever an id is taken: the
-full id (`WindowId(1)/view-1.panel[0]`), the global id (`view-1.panel`), or a
-suffix (`panel`) — the first match wins. Give the elements you want to target
-stable ids in the app (`div().id("results")`).
+**Element ids** come in four forms, all accepted wherever an id is taken: a
+`@ref` from the last `ui_snapshot`, the full id
+(`WindowId(1)/view-1.panel[0]`), the global id (`view-1.panel`), or a suffix
+(`panel`) — the first match wins. An id copied out of `format: "compact"`
+output works too, shortened crate paths and instance suffix and all. Give the
+elements you want to target stable ids in the app (`div().id("results")`): a
+lowercase, dashed id is what the snapshot prints as `#results`.
+
+### The snapshot
+
+```
+ui_snapshot 4 — WindowId(1v1), 9 of 96 painted elements
+- button #github @e1
+- button #menu @e2
+- textbox #input-4294967299 @e9
+```
+
+An element earns a line by having a role, an id somebody chose, or text;
+everything else is dropped and its children take its place. The role comes
+from the file that rendered the element — for gpui-component's own widgets the
+file name *is* the role, so `button/button.rs` renders a `button` and an app
+gets that vocabulary without annotating anything. A role that describes a
+region (`banner`, `list`, `dialog`, …) is only used when the element actually
+contains something, because one file paints both a title bar and its close
+button. Widgets an app writes itself have no role yet and appear by id and
+text; explicit annotations are the next step.
+
+Each `@ref` is shorthand for "the thing on that line of the snapshot I just
+showed you", and the next snapshot replaces the whole set — a stale ref fails
+with a message saying to take a new one rather than resolving to whatever now
+sits on that line.
 
 ## Getting an agent up to speed
 
@@ -187,8 +233,8 @@ server's shape by trial and error. It is told instead, on four surfaces, all
 generated from one table in `src/docs.rs`:
 
 - **`initialize` instructions** — a short orientation the client keeps in
-  context for the whole session: the three-step start, the three element-id
-  forms, the one-frame staleness caveat, and where the rest is.
+  context for the whole session: the three-step start, the four element-id
+  forms, what an input answer already tells it, and where the rest is.
 - **the `gpui_guide` tool** — the long form, one topic per call:
   `overview`, `tools`, `recipes`, `ids`, `focus`, `screenshots`,
   `troubleshooting`. The server answers it itself, without touching the
@@ -247,10 +293,17 @@ cargo test                 # protocol serde defaults, socket names, the guide su
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same three on Linux and Windows.
-This repo is deliberately small: the binary in `src/main.rs`, the wire types
-in `src/protocol.rs`. The in-app logic (main-thread dispatch, how gpui's flat
-inspector list becomes a tree, rendering screenshots) lives in
-`gpui_component::mcp`.
+
+This repo is deliberately small: the binary in `src/main.rs`, the wire types in
+`src/protocol.rs`, and what the server tells an agent about itself in
+`src/docs.rs`. The in-app logic — main-thread dispatch, waiting for frames, how
+gpui's flat inspector list becomes a tree and then a snapshot, rendering
+screenshots — lives in `gpui_component::mcp`.
+
+Before changing behaviour here, read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Several things that look like obvious simplifications are load-bearing: why
+settling waits for *two* frame callbacks, why refs are replaced whole, why a
+region role has to contain something, and when `PROTOCOL_VERSION` is bumped.
 
 ## License
 

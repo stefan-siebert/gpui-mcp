@@ -6,8 +6,21 @@ Guidance for Claude Code when working in this repository.
 
 `gpui-mcp-inspector` — an MCP server (`gpui-mcp-server` binary) that lets an AI
 agent inspect and drive a running GPUI app, plus the wire types
-(`gpui_mcp_protocol` lib) shared with the in-app side. README.md is the
-authoritative description; keep it in sync when behaviour changes.
+(`gpui_mcp_protocol` lib) shared with the in-app side.
+
+Three documents, three audiences — keep whichever ones a change touches in
+sync:
+
+- **README.md** — for someone using or installing it. The authoritative
+  description of behaviour.
+- **docs/ARCHITECTURE.md** — for someone changing it: the measurements the
+  design rests on, the frame contract, and which apparent simplifications are
+  load-bearing. Read it before altering behaviour; add to it when a decision
+  is made that a later reader would otherwise undo.
+- **PLAN.md** — the roadmap, with stages marked done as they land.
+
+A fourth lives in the code: `src/docs.rs` is what the server tells the *agent*,
+and a test fails if it stops matching the tool list.
 
 ```
 MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJSON──▶ gpui_component::mcp (in the app)
@@ -37,7 +50,8 @@ MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJS
   `protocol.rs`, a params struct if needed, the JSON schema in `tools_list()`
   in `main.rs`, the handler in gpui-component, the row in README.md, and the
   entry in the `tools` topic of `docs.rs` — a test fails until that last one
-  exists.
+  exists — and a row in the tool table of gpui-component's `docs/docs/mcp.md`
+  (plus its `zh-CN` mirror, which that repo requires).
 - Docs and code comments in English.
 - `wait_for` and `batch` are answered asynchronously by the app (it waits for
   frames); every other method is answered from the frame already painted. Input
