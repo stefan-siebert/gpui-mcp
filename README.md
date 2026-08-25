@@ -22,9 +22,10 @@ Works on Linux, macOS and Windows.
         │  {temp_dir}/gpui-mcp-{app}-{pid}.sock   (uds_windows on Windows)
         ▼
  your GPUI app
-   gpui_component::mcp       ← the in-app side: a listener thread queues each
-                               request; the GPUI main thread polls the queue
-                               and answers from gpui's inspector data
+   gpui_component::mcp       ← the in-app side: a listener thread hands each
+                               request to the GPUI main thread, which answers
+                               from gpui's inspector data — after waiting for
+                               the frame that shows what an input changed
 ```
 
 Three pieces, in three repositories:
@@ -146,29 +147,60 @@ deletes the ones nothing listens on (left behind by a crashed app).
 
 | tool | what it does |
 |---|---|
+| `gpui_guide` | this server's own documentation — the three-step start, worked examples, how ids resolve, the traps. Answered by the server, so it works before the app runs |
 | `get_windows` | open windows with id, title, bounds, active flag — the window ids the other tools take |
 | `get_app_state` | window overview plus whatever the app's state provider returns (`app` key) |
 | `inspect_ui_tree` | the element hierarchy: id, type (from the source file), bounds, `source_location`, children, text. Filters: `max_depth`, `window_id`, `root_element_id`, `element_type_filter`, `text_filter`, `format: compact` |
 | `get_element` | one element with its full subtree |
-| `get_focus_info` | focused element and the active key-context chain — the first thing to check when a key binding does not fire |
+| `get_focus_info` | the focus handle and the active key-context chain — the first thing to check when a key binding does not fire |
 | `list_actions` | the app's gpui actions; `include_bindings` adds key bindings and docs, `only_available` keeps those whose context predicate matches the current focus |
 | `execute_action` | dispatch a named action through the focus chain, as a keystroke would |
 | `send_key` | one keystroke in gpui's notation (`enter`, `pagedown`, `f5`; modifiers as flags) |
 | `type_text` | a string, one keystroke per character |
 | `click_element` | left/right/middle click at an element's centre or at window pixel coordinates |
-| `take_screenshot` | the window (or one element, cropped) rendered to PNG |
+| `wait_for` | wait inside the app, one check per painted frame, until an element, a text, a key context or an app-state value is there — or, with `absent`, gone |
+| `batch` | several tools in one call, in order, with one state snapshot at the end — the way to spend one turn instead of four |
+| `take_screenshot` | the window (or one element, cropped) rendered to PNG, downscaled to 1400px wide unless `max_width` says otherwise |
 | `get_logs` | the in-app log buffer (≤500 lines) |
 
 Every input tool (`send_key`, `type_text`, `click_element`, `execute_action`)
-returns the app state and focus info *after* the event was dispatched, so the
-agent usually sees the effect without a second round trip. The app's own
-debounce or async work may not have finished yet — read `get_app_state` again
-if a value looks stale.
+waits for the frame that shows what it changed, then appends the app state and
+focus info from *that* frame, so the answer describes the app after the input
+rather than the app it replaced. `settled: false` in an answer means no frame
+was painted while it waited — a minimised or occluded window — and everything
+in that answer describes an older frame.
+
+What this cannot cover is work the app starts on its own: an async load, a
+debounce, an animation. That is what `wait_for` is for, and it waits inside the
+app rather than costing the agent a call per look.
 
 **Element ids** come in three forms, all accepted wherever an id is taken: the
 full id (`WindowId(1)/view-1.panel[0]`), the global id (`view-1.panel`), or a
 suffix (`panel`) — the first match wins. Give the elements you want to target
 stable ids in the app (`div().id("results")`).
+
+## Getting an agent up to speed
+
+The socket round trip costs about a millisecond; the model turn wrapped around
+it costs seconds. So the expensive mistake is an agent that learns this
+server's shape by trial and error. It is told instead, on four surfaces, all
+generated from one table in `src/docs.rs`:
+
+- **`initialize` instructions** — a short orientation the client keeps in
+  context for the whole session: the three-step start, the three element-id
+  forms, the one-frame staleness caveat, and where the rest is.
+- **the `gpui_guide` tool** — the long form, one topic per call:
+  `overview`, `tools`, `recipes`, `ids`, `focus`, `screenshots`,
+  `troubleshooting`. The server answers it itself, without touching the
+  socket, so reading the guide works before the app is started — which is when
+  it is most likely to be read.
+- **resources** — the same topics as `gpui://guide/<topic>`, for clients that
+  attach resources rather than call tools.
+- **the `onboard` prompt** — overview, tools and recipes in one message.
+  Claude Code surfaces it as `/gpui-inspector:onboard`.
+
+A test asserts that every method in `methods::ALL` appears in the `tools`
+topic, so a new tool cannot ship undocumented.
 
 ## Platform notes
 
@@ -186,6 +218,11 @@ stable ids in the app (`div().id("results")`).
 - *"No GPUI app found"* — the app is not running, was built without the
   feature, or its `init_mcp` did not run. The app prints
   `[MCP] IPC Server listening on …` to stderr when it did.
+- *"gpui-mcp protocol mismatch"* — the app and this server were built from one
+  crate at different times and have drifted. The message names which half to
+  rebuild. Protocol v2 (frame-synchronous input answers, `wait_for`, `batch`)
+  needs both halves rebuilt: `cargo build --release` here, and a normal build
+  of the app.
 - *Tools do not appear in Claude Code* — restart the session after
   `claude mcp add`; check `claude mcp get gpui-inspector`.
 - *Keys reach the wrong element* — `get_focus_info` shows the focus chain and
@@ -206,7 +243,7 @@ lives in a per-user temp directory but is not otherwise authenticated.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test                 # protocol serde defaults + socket-name parsing
+cargo test                 # protocol serde defaults, socket names, the guide surface
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same three on Linux and Windows.

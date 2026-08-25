@@ -11,6 +11,8 @@ use uds_windows::UnixStream;
 
 use gpui_mcp_protocol::protocol::*;
 
+mod docs;
+
 /// MCP Server for GPUI inspection and automation.
 ///
 /// Communicates over stdio with Claude (MCP Protocol)
@@ -167,6 +169,44 @@ fn resolve_socket_path() -> Result<String> {
     }
 }
 
+/// An image lifted out of a tool result and handed to the agent as its own
+/// content block.
+struct InlineImage {
+    data: String,
+    mime_type: String,
+}
+
+/// Turn the temp-file handoff the app returns into an image the agent can
+/// actually see, and take the file with it.
+///
+/// Replaces the path in `result` with the image's metadata. Returns `None`
+/// when the file cannot be read, leaving the path in place: an answer naming
+/// a file is at least diagnosable, where a silently missing image is not.
+fn inline_screenshot(result: &mut serde_json::Value) -> Option<InlineImage> {
+    let shot: ScreenshotResult = serde_json::from_value(result.clone()).ok()?;
+
+    let bytes = std::fs::read(&shot.path).ok()?;
+    // The file is a temp handoff from the app; it is ours to delete.
+    let _ = std::fs::remove_file(&shot.path);
+
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+    *result = json!({
+        "width": shot.width,
+        "height": shot.height,
+        "format": shot.format,
+        "scale": shot.scale,
+        "element_id": shot.element_id,
+        "note": "The image is attached to this answer as its own content block.",
+    });
+
+    Some(InlineImage {
+        data,
+        mime_type: format!("image/{}", shot.format),
+    })
+}
+
 impl GpuiMcpServer {
     fn new() -> Self {
         Self
@@ -226,42 +266,45 @@ impl GpuiMcpServer {
         }
     }
 
-    /// Forward a tool call to the app. Tool names equal IPC method names;
-    /// `take_screenshot` additionally turns the PNG path the app returns into
-    /// inline base64 data.
+    /// Forward a tool call to the app. Tool names equal IPC method names.
+    ///
+    /// Any screenshot in the answer — the whole answer for `take_screenshot`,
+    /// or one step of a `batch` — is lifted out of the JSON and returned
+    /// alongside it, so the agent sees a picture rather than a path into a
+    /// temp directory it cannot read.
     fn handle_tool_call(
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<(serde_json::Value, Vec<InlineImage>)> {
         if !methods::ALL.contains(&tool_name) {
             anyhow::bail!("Unknown tool: {}", tool_name);
         }
 
-        let result = self.send_ipc_request(tool_name, arguments)?;
-        if tool_name != methods::TAKE_SCREENSHOT {
-            return Ok(result);
+        let mut result = self.send_ipc_request(tool_name, arguments)?;
+        let mut images = Vec::new();
+
+        match tool_name {
+            methods::TAKE_SCREENSHOT => images.extend(inline_screenshot(&mut result)),
+            methods::BATCH => {
+                for step in result
+                    .get_mut("steps")
+                    .and_then(|steps| steps.as_array_mut())
+                    .into_iter()
+                    .flatten()
+                {
+                    if step["method"] != methods::TAKE_SCREENSHOT || step["ok"] != json!(true) {
+                        continue;
+                    }
+                    if let Some(step_result) = step.get_mut("result") {
+                        images.extend(inline_screenshot(step_result));
+                    }
+                }
+            }
+            _ => {}
         }
 
-        let shot: ScreenshotResult = serde_json::from_value(result)
-            .context("Unexpected take_screenshot response from app")?;
-
-        let png_data = std::fs::read(&shot.path)
-            .with_context(|| format!("Failed to read screenshot file: {}", shot.path))?;
-        // The file is a temp handoff from the app; it is ours to delete.
-        let _ = std::fs::remove_file(&shot.path);
-
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-
-        Ok(json!({
-            "width": shot.width,
-            "height": shot.height,
-            "format": "png",
-            "data": b64,
-            "encoding": "base64",
-            "element_id": shot.element_id,
-        }))
+        Ok((result, images))
     }
 }
 
@@ -298,12 +341,177 @@ fn send_response(stdout: &mut impl Write, response: &McpResponse) -> Result<()> 
     Ok(())
 }
 
+/// A successful JSON-RPC result.
+fn ok_response(id: serde_json::Value, result: serde_json::Value) -> McpResponse {
+    McpResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: Some(result),
+        error: None,
+    }
+}
+
+/// A JSON-RPC `Invalid params` error — a resource or prompt that does not
+/// exist, with a message naming what does.
+fn invalid_params(id: serde_json::Value, message: String) -> McpResponse {
+    McpResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: None,
+        error: Some(McpError {
+            code: -32602,
+            message,
+        }),
+    }
+}
+
+/// Serve one documentation topic.
+///
+/// Deliberately answered without touching the socket: the first thing an
+/// agent does should work before the app is started, and a guide that fails
+/// with "No running GPUI app found" would teach exactly the wrong lesson.
+fn guide_result(arguments: &serde_json::Value) -> serde_json::Value {
+    let requested = arguments
+        .get("topic")
+        .and_then(|topic| topic.as_str())
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty())
+        .unwrap_or(docs::DEFAULT_TOPIC);
+
+    match docs::topic(requested) {
+        Some(topic) => json!({ "content": [{ "type": "text", "text": topic.body }] }),
+        None => json!({
+            "content": [{ "type": "text", "text": docs::unknown_topic_message(requested) }],
+            "isError": true
+        }),
+    }
+}
+
+/// The same topics as MCP resources, for clients that attach resources
+/// instead of calling tools.
+fn resources_list() -> serde_json::Value {
+    let resources: Vec<serde_json::Value> = docs::TOPICS
+        .iter()
+        .map(|topic| {
+            json!({
+                "uri": format!("{}{}", docs::RESOURCE_PREFIX, topic.name),
+                "name": format!("gpui-mcp guide: {}", topic.name),
+                "description": topic.summary,
+                "mimeType": "text/markdown",
+            })
+        })
+        .collect();
+
+    json!({ "resources": resources })
+}
+
+/// Read one guide resource. `Err` carries the message for a JSON-RPC error.
+fn read_resource(uri: &str) -> Result<serde_json::Value, String> {
+    let name = uri.strip_prefix(docs::RESOURCE_PREFIX).ok_or_else(|| {
+        format!(
+            "Unknown resource '{}'. Guide resources start with {}",
+            uri,
+            docs::RESOURCE_PREFIX
+        )
+    })?;
+
+    let topic = docs::topic(name).ok_or_else(|| docs::unknown_topic_message(name))?;
+
+    Ok(json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": "text/markdown",
+            "text": topic.body,
+        }]
+    }))
+}
+
+/// One prompt, which clients such as Claude Code surface as a slash command.
+fn prompts_list() -> serde_json::Value {
+    json!({
+        "prompts": [{
+            "name": docs::PROMPT_NAME,
+            "description": "Everything needed to drive a GPUI app through gpui-mcp: \
+                            orientation, the tool list and worked examples.",
+            "arguments": [{
+                "name": "topic",
+                "description": format!(
+                    "One topic ({}). Omitted: overview, tools and recipes together.",
+                    docs::topic_names()
+                ),
+                "required": false
+            }]
+        }]
+    })
+}
+
+/// Answer `prompts/get`. `Err` carries the message for a JSON-RPC error.
+fn get_prompt(name: &str, arguments: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if name != docs::PROMPT_NAME {
+        return Err(format!(
+            "Unknown prompt '{}'. This server offers '{}'.",
+            name,
+            docs::PROMPT_NAME
+        ));
+    }
+
+    let requested = arguments
+        .get("topic")
+        .and_then(|topic| topic.as_str())
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty());
+
+    let text = match requested {
+        Some(name) => docs::topic(name)
+            .map(|topic| topic.body.to_string())
+            .ok_or_else(|| docs::unknown_topic_message(name))?,
+        // No topic asked for: the three that get an agent working, in reading
+        // order. The rest are one tool call away.
+        None => ["overview", "tools", "recipes"]
+            .iter()
+            .filter_map(|name| docs::topic(name))
+            .map(|topic| topic.body)
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n"),
+    };
+
+    Ok(json!({
+        "description": "How to drive a GPUI app through gpui-mcp.",
+        "messages": [{
+            "role": "user",
+            "content": { "type": "text", "text": text }
+        }]
+    }))
+}
+
 fn tools_list() -> serde_json::Value {
     json!({
         "tools": [
             {
+                "name": docs::TOOL_NAME,
+                "description": format!(
+                    "Read this first. How to drive a GPUI app through this server: the three-step \
+                     start, worked examples for every common task, how element ids resolve, and \
+                     the traps that otherwise cost a round trip each. Answered by the server \
+                     itself, so it works before the app is even running. Topics: {}. \
+                     Example: {{\"topic\": \"recipes\"}}",
+                    docs::topic_names()
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "enum": docs::TOPICS.iter().map(|t| t.name).collect::<Vec<_>>(),
+                            "description": "Which topic to read. Default: overview."
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "get_windows",
-                "description": "List all open GPUI windows with their ID, title, bounds, and active status. Use this first to discover window IDs for other tools. Returns: [{id, title, bounds: {x,y,width,height}, is_active}]",
+                "description": "List all open GPUI windows with their ID, title, bounds, and active status. Use this first to discover window IDs for other tools. Returns: [{id, title, bounds: {x,y,width,height}, is_active}]. Example: {}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -312,7 +520,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "inspect_ui_tree",
-                "description": "Get the UI element hierarchy for debugging layout and structure. Each element has: id, element_type (derived from source file), bounds, source_location, children, properties. Use max_depth to limit tree size (default: unlimited). Use root_element_id to inspect a subtree instead of the whole app. Use format='compact' to strip verbose fields (bounds, content_mask, source_location, content_size). WARNING: Without filters this can return very large responses.",
+                "description": "Get the UI element hierarchy for debugging layout and structure. Each element has: id, element_type (derived from source file), bounds, source_location, children, properties. Use max_depth to limit tree size (default: unlimited). Use root_element_id to inspect a subtree instead of the whole app. Use format='compact' to strip verbose fields (bounds, content_mask, source_location, content_size). WARNING: Without filters this can return very large responses. Example: {\"max_depth\": 3, \"format\": \"compact\"}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -347,7 +555,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_element",
-                "description": "Get a UI element and its full subtree by ID. Supports exact full_id, global_id, or suffix match. Returns the element with all descendants, text content, bounds, source location, and properties.",
+                "description": "Get a UI element and its full subtree by ID. Supports exact full_id, global_id, or suffix match. Returns the element with all descendants, text content, bounds, source location, and properties. Example: {\"element_id\": \"results\"}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -361,7 +569,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_focus_info",
-                "description": "Get information about the currently focused element and active key contexts. Essential for debugging keyboard/focus issues. Returns: {has_focus, focus_id, window_id, key_contexts: [...]}",
+                "description": "Get information about the currently focused element and active key contexts. Essential for debugging keyboard/focus issues. Returns: {has_focus, focus_id, window_id, key_contexts: [...]}. Example: {}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -375,7 +583,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "list_actions",
-                "description": "List GPUI actions that can be dispatched via execute_action. Actions are the keyboard shortcuts and commands of the app (e.g. 'elane::CursorUp', 'elane::ToggleTerminal'). Use filter to search by name substring. Set include_bindings=true for keybinding and context info. Set only_available=true to restrict results to actions whose binding context matches the current focus chain — i.e. 'what can I actually press right now?' (implies include_bindings=true).",
+                "description": "List GPUI actions that can be dispatched via execute_action. Actions are the keyboard shortcuts and commands of the app (e.g. 'elane::CursorUp', 'elane::ToggleTerminal'). Use filter to search by name substring. Set include_bindings=true for keybinding and context info. Set only_available=true to restrict results to actions whose binding context matches the current focus chain — i.e. 'what can I actually press right now?' (implies include_bindings=true). Example: {\"filter\": \"toggle\", \"include_bindings\": true}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -423,7 +631,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "send_key",
-                "description": "Send a keyboard keystroke to the app. The key is dispatched to the focused element. Use GPUI key format: lowercase key name with modifier prefixes. Examples: 'a', 'enter', 'escape', 'tab', 'f1', 'up', 'down'. Modifiers via the modifiers object.",
+                "description": "Send a keyboard keystroke to the app. The key is dispatched to the focused element. Use GPUI key format: lowercase key name with modifier prefixes. Examples: 'a', 'enter', 'escape', 'tab', 'f1', 'up', 'down'. Modifiers via the modifiers object. Example: {\"key\": \"s\", \"modifiers\": {\"ctrl\": true}}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -450,7 +658,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "click_element",
-                "description": "Simulate a mouse click. Provide EITHER element_id (clicks center of that element) OR x/y pixel coordinates. Element ID supports full_id, global_id, or suffix match.",
+                "description": "Simulate a mouse click. Provide EITHER element_id (clicks center of that element) OR x/y pixel coordinates. Element ID supports full_id, global_id, or suffix match. Example: {\"element_id\": \"save-button\"}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -475,7 +683,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "type_text",
-                "description": "Type a text string into the focused element by dispatching individual keystrokes. Much more convenient than send_key for entering text in input fields and dialogs.",
+                "description": "Type a text string into the focused element by dispatching individual keystrokes. Much more convenient than send_key for entering text in input fields and dialogs. Example: {\"text\": \"src/main.rs\"}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -492,8 +700,86 @@ fn tools_list() -> serde_json::Value {
                 }
             },
             {
+                "name": "wait_for",
+                "description": "Wait until the app looks a certain way, then answer. The app checks once per painted frame, so waiting here costs nothing — NEVER poll by calling inspect_ui_tree or get_app_state in a loop, that costs a round trip per look. Every condition given must hold at the same time. Set absent=true to wait for them to STOP holding, which is how you wait for a dialog to close or a spinner to disappear. Running out of time is not an error: the answer says satisfied:false and 'checks' names the part that was missing. Example: {\"text\": \"Saved\", \"timeout_ms\": 5000}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "element_id": {
+                            "type": "string",
+                            "description": "Wait until an element with this id is painted. Full id, global_id or suffix, as everywhere else."
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Wait until this text is painted anywhere in the window (case-insensitive)."
+                        },
+                        "key_context": {
+                            "type": "string",
+                            "description": "Wait until this key context is on the focus chain (substring, case-insensitive) — how you wait for a dialog or a mode to take the keyboard."
+                        },
+                        "app_state_path": {
+                            "type": "string",
+                            "description": "JSON pointer into the get_app_state answer, e.g. '/app/rows'. Without app_state_equals the condition is 'this resolves to something other than null'."
+                        },
+                        "app_state_equals": {
+                            "description": "The value app_state_path must reach."
+                        },
+                        "absent": {
+                            "type": "boolean",
+                            "description": "Invert: wait until the conditions stop holding. Default: false."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Give up after this long. Default 3000, capped at 30000."
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to watch (default: active window)"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "batch",
+                "description": "Run several tools in one call. Steps run in order inside the app and the answer carries each step's result plus one app_state/focus_info at the end. This is the main way to spend fewer turns: click, type, enter, wait is ONE call instead of four. Steps stop at the first failure unless stop_on_error is false. A batch cannot contain another batch. Screenshots taken inside a batch come back as images attached to the answer. Example: {\"steps\": [{\"method\": \"click_element\", \"params\": {\"element_id\": \"search\"}}, {\"method\": \"type_text\", \"params\": {\"text\": \"main.rs\"}}, {\"method\": \"send_key\", \"params\": {\"key\": \"enter\"}}, {\"method\": \"wait_for\", \"params\": {\"text\": \"main.rs\"}}]}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "steps": {
+                            "type": "array",
+                            "description": "The steps, in order. At most 32.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "method": {
+                                        "type": "string",
+                                        "enum": methods::ALL.iter().filter(|method| **method != methods::BATCH).collect::<Vec<_>>(),
+                                        "description": "The tool to run for this step."
+                                    },
+                                    "params": {
+                                        "type": "object",
+                                        "description": "That tool's arguments."
+                                    }
+                                },
+                                "required": ["method"]
+                            }
+                        },
+                        "stop_on_error": {
+                            "type": "boolean",
+                            "description": "Stop at the first failing step. Default: true. Turning it off means later steps run against whatever state the failure left behind."
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Default window for steps that do not name one."
+                        }
+                    },
+                    "required": ["steps"]
+                }
+            },
+            {
                 "name": "take_screenshot",
-                "description": "Take a screenshot of a window or a specific element. Renders the current window content to a PNG image. Optionally crop to a specific element by ID for a focused, higher-detail view.",
+                "description": "Take a screenshot of a window or a specific element. Renders the current window content to a PNG image. Optionally crop to a specific element by ID for a focused, higher-detail view. Example: {\"element_id\": \"sidebar\"}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -504,6 +790,10 @@ fn tools_list() -> serde_json::Value {
                         "element_id": {
                             "type": "string",
                             "description": "Crop screenshot to this element's bounds. Supports full_id, global_id, or suffix match from inspect_ui_tree."
+                        },
+                        "max_width": {
+                            "type": "integer",
+                            "description": "Downscale until the image is at most this wide in pixels. Default 1400; 0 keeps every pixel. An image costs tokens by its dimensions, so ask for full size only when you need to read fine detail. When the image was scaled the answer says so, and coordinates read off it are no longer window coordinates."
                         }
                     },
                     "required": []
@@ -511,7 +801,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_app_state",
-                "description": "Get a snapshot of the application state: window count, active window, and per-window bounds/titles. Quick overview without the full UI tree.",
+                "description": "Get a snapshot of the application state: window count, active window, and per-window bounds/titles. Quick overview without the full UI tree. Example: {}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -520,7 +810,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_logs",
-                "description": "Get recent MCP-related log entries (up to 500 buffered). Useful for debugging MCP interactions and seeing results of dispatched actions/keys.",
+                "description": "Get recent MCP-related log entries (up to 500 buffered). Useful for debugging MCP interactions and seeing results of dispatched actions/keys. Example: {}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -590,12 +880,17 @@ fn main() -> Result<()> {
                         result: Some(json!({
                             "protocolVersion": "2024-11-05",
                             "capabilities": {
-                                "tools": {}
+                                "tools": {},
+                                "resources": {},
+                                "prompts": {}
                             },
                             "serverInfo": {
                                 "name": "gpui-mcp-inspector",
                                 "version": env!("CARGO_PKG_VERSION")
-                            }
+                            },
+                            // Short orientation, always in the agent's
+                            // context. The long form is the `gpui_guide` tool.
+                            "instructions": docs::INSTRUCTIONS
                         })),
                         error: None,
                     },
@@ -638,33 +933,34 @@ fn main() -> Result<()> {
                 let tool_name = params["name"].as_str().unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-                let result = server.handle_tool_call(tool_name, arguments);
+                // The guide is the server's own; forwarding it would fail
+                // whenever no app is running, which is precisely when an
+                // agent is most likely to be reading it.
+                if tool_name == docs::TOOL_NAME {
+                    send_response(&mut stdout, &ok_response(id, guide_result(&arguments)))?;
+                    continue;
+                }
 
-                let response = match result {
-                    Ok(content) => {
-                        // For screenshots, return as MCP image content
-                        let mcp_content = match content["data"].as_str() {
-                            Some(data) if tool_name == methods::TAKE_SCREENSHOT => json!({
-                                "content": [
-                                    { "type": "image", "data": data, "mimeType": "image/png" },
-                                    {
-                                        "type": "text",
-                                        "text": format!("Screenshot: {}x{}", content["width"], content["height"])
-                                    }
-                                ]
-                            }),
-                            _ => json!({
-                                "content": [{
-                                    "type": "text",
-                                    "text": serde_json::to_string_pretty(&content)?
-                                }]
-                            }),
-                        };
+                let response = match server.handle_tool_call(tool_name, arguments) {
+                    Ok((content, images)) => {
+                        let mut blocks = vec![json!({
+                            "type": "text",
+                            "text": serde_json::to_string_pretty(&content)?,
+                        })];
+                        // One image for a screenshot, possibly several from a
+                        // batch that took more than one.
+                        for image in images {
+                            blocks.push(json!({
+                                "type": "image",
+                                "data": image.data,
+                                "mimeType": image.mime_type,
+                            }));
+                        }
 
                         McpResponse {
                             jsonrpc: "2.0".to_string(),
                             id,
-                            result: Some(mcp_content),
+                            result: Some(json!({ "content": blocks })),
                             error: None,
                         }
                     }
@@ -682,6 +978,53 @@ fn main() -> Result<()> {
                     },
                 };
 
+                send_response(&mut stdout, &response)?;
+            }
+
+            // The guide again, as resources — some clients attach those
+            // rather than call a tool for them.
+            "resources/list" => {
+                send_response(&mut stdout, &ok_response(id, resources_list()))?;
+            }
+
+            // Nothing here is templated, but answering keeps a client that
+            // probes for templates from logging a "method not found".
+            "resources/templates/list" => {
+                send_response(
+                    &mut stdout,
+                    &ok_response(id, json!({ "resourceTemplates": [] })),
+                )?;
+            }
+
+            "resources/read" => {
+                let uri = request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("uri"))
+                    .and_then(|uri| uri.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let response = match read_resource(&uri) {
+                    Ok(contents) => ok_response(id, contents),
+                    Err(message) => invalid_params(id, message),
+                };
+                send_response(&mut stdout, &response)?;
+            }
+
+            "prompts/list" => {
+                send_response(&mut stdout, &ok_response(id, prompts_list()))?;
+            }
+
+            "prompts/get" => {
+                let params = request.params.clone().unwrap_or(json!({}));
+                let name = params["name"].as_str().unwrap_or("");
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+                let response = match get_prompt(name, &arguments) {
+                    Ok(prompt) => ok_response(id, prompt),
+                    Err(message) => invalid_params(id, message),
+                };
                 send_response(&mut stdout, &response)?;
             }
 
@@ -714,6 +1057,142 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guide only helps if it is the first thing an agent sees.
+    #[test]
+    fn the_guide_is_advertised_first() {
+        let tools = tools_list();
+        let tools = tools["tools"].as_array().expect("tools array");
+        assert_eq!(tools[0]["name"], docs::TOOL_NAME);
+        assert_eq!(
+            tools.len(),
+            methods::ALL.len() + 1,
+            "every IPC method plus the guide"
+        );
+        for method in methods::ALL {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == *method),
+                "tool '{method}' is not advertised"
+            );
+        }
+    }
+
+    /// A `topic` outside the schema's enum would be refused by strict clients
+    /// before it ever reaches `guide_result`.
+    #[test]
+    fn the_guide_schema_offers_every_topic() {
+        let tools = tools_list();
+        let enum_values = tools["tools"][0]["inputSchema"]["properties"]["topic"]["enum"]
+            .as_array()
+            .expect("topic enum")
+            .clone();
+        assert_eq!(enum_values.len(), docs::TOPICS.len());
+        for topic in docs::TOPICS {
+            assert!(
+                enum_values.iter().any(|value| value == topic.name),
+                "{} missing from the schema enum",
+                topic.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_guide_defaults_to_the_overview() {
+        let overview = docs::topic(docs::DEFAULT_TOPIC).unwrap().body;
+        for arguments in [json!({}), json!({ "topic": "" }), json!({ "topic": "  " })] {
+            let result = guide_result(&arguments);
+            assert_eq!(result["content"][0]["text"], overview, "{arguments}");
+            assert!(result.get("isError").is_none());
+        }
+    }
+
+    #[test]
+    fn the_guide_serves_the_topic_asked_for() {
+        let result = guide_result(&json!({ "topic": "recipes" }));
+        assert_eq!(
+            result["content"][0]["text"],
+            docs::topic("recipes").unwrap().body
+        );
+    }
+
+    #[test]
+    fn a_bad_topic_gets_the_menu_not_a_shrug() {
+        let result = guide_result(&json!({ "topic": "nonsense" }));
+        assert_eq!(result["isError"], json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("nonsense"));
+        for topic in docs::TOPICS {
+            assert!(text.contains(topic.name), "{} not offered", topic.name);
+        }
+    }
+
+    #[test]
+    fn every_topic_is_readable_as_a_resource() {
+        let listed = resources_list();
+        let listed = listed["resources"].as_array().unwrap().clone();
+        assert_eq!(listed.len(), docs::TOPICS.len());
+
+        for resource in listed {
+            let uri = resource["uri"].as_str().unwrap();
+            let contents = read_resource(uri).expect("listed resource must be readable");
+            let name = uri.strip_prefix(docs::RESOURCE_PREFIX).unwrap();
+            assert_eq!(contents["contents"][0]["uri"], uri);
+            assert_eq!(
+                contents["contents"][0]["text"],
+                docs::topic(name).unwrap().body
+            );
+        }
+    }
+
+    #[test]
+    fn a_resource_outside_the_guide_is_refused() {
+        for uri in [
+            "gpui://guide/nonsense",
+            "file:///etc/passwd",
+            "gpui://something-else",
+            "",
+        ] {
+            assert!(read_resource(uri).is_err(), "{uri} should not resolve");
+        }
+    }
+
+    #[test]
+    fn the_prompt_without_a_topic_carries_the_starting_three() {
+        let prompt = get_prompt(docs::PROMPT_NAME, &json!({})).expect("prompt");
+        let text = prompt["messages"][0]["content"]["text"].as_str().unwrap();
+        for name in ["overview", "tools", "recipes"] {
+            assert!(
+                text.contains(docs::topic(name).unwrap().body),
+                "{name} missing from the onboarding prompt"
+            );
+        }
+        assert_eq!(prompt["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn the_prompt_can_be_narrowed_to_one_topic() {
+        let prompt = get_prompt(docs::PROMPT_NAME, &json!({ "topic": "focus" })).expect("prompt");
+        assert_eq!(
+            prompt["messages"][0]["content"]["text"],
+            docs::topic("focus").unwrap().body
+        );
+    }
+
+    #[test]
+    fn an_unknown_prompt_names_the_one_that_exists() {
+        let error = get_prompt("nope", &json!({})).expect_err("unknown prompt");
+        assert!(error.contains(docs::PROMPT_NAME), "{error}");
+        let error =
+            get_prompt(docs::PROMPT_NAME, &json!({ "topic": "nope" })).expect_err("unknown topic");
+        assert!(error.contains("nope"), "{error}");
+    }
+
+    /// `handle_tool_call` forwards over the socket; the guide must never get
+    /// that far, or it would fail exactly when it is needed most.
+    #[test]
+    fn the_guide_is_not_an_ipc_method() {
+        assert!(!methods::ALL.contains(&docs::TOOL_NAME));
+    }
 
     #[test]
     fn parse_basic_name() {

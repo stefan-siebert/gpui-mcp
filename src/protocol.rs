@@ -20,7 +20,14 @@ use std::collections::HashMap;
 /// compatible** — a new `#[serde(default)]` field is not, a renamed or
 /// retyped field is. Bumping it for a compatible change costs everyone a
 /// rebuild for nothing.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// - **v2** — input methods answer only once the frame that shows their effect
+///   has been painted, and `wait_for` / `batch` exist. The types stayed
+///   compatible here, but the behaviour did not: a new server paired with an
+///   old app would promise frame-synchronous answers the app does not give and
+///   advertise two methods it does not know. That is worth one rebuild rather
+///   than a mystery.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What a peer built before this handshake existed appears as: it sends no
 /// version at all, and `#[serde(default)]` reads that back as zero.
@@ -149,7 +156,7 @@ pub struct WindowInfo {
 
 /// Result of [`methods::TAKE_SCREENSHOT`].
 ///
-/// The app writes the PNG to a temporary file and returns its path; the MCP
+/// The app writes the image to a temporary file and returns its path; the MCP
 /// server reads, base64-encodes and deletes the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenshotResult {
@@ -158,6 +165,10 @@ pub struct ScreenshotResult {
     pub height: u32,
     /// Always `"png"`.
     pub format: String,
+    /// Set when the image was downscaled, so the caller can tell that pixel
+    /// coordinates in it are not window coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f32>,
     /// Set when the screenshot was cropped to an element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_id: Option<String>,
@@ -219,6 +230,8 @@ pub mod methods {
     pub const GET_FOCUS_INFO: &str = "get_focus_info";
 
     // Automation
+    pub const WAIT_FOR: &str = "wait_for";
+    pub const BATCH: &str = "batch";
     pub const CLICK_ELEMENT: &str = "click_element";
     pub const SEND_KEY: &str = "send_key";
     pub const TYPE_TEXT: &str = "type_text";
@@ -240,6 +253,8 @@ pub mod methods {
         SEND_KEY,
         CLICK_ELEMENT,
         TYPE_TEXT,
+        WAIT_FOR,
+        BATCH,
         TAKE_SCREENSHOT,
         GET_APP_STATE,
         GET_LOGS,
@@ -262,7 +277,22 @@ pub struct TakeScreenshotParams {
     /// If set, crop the screenshot to this element's bounds.
     #[serde(default)]
     pub element_id: Option<String>,
+    /// Downscale until the image is at most this wide, in device pixels.
+    /// Omitted: [`DEFAULT_SCREENSHOT_MAX_WIDTH`]. Zero: no downscaling.
+    ///
+    /// A full-window image at a high DPI costs an agent a large share of its
+    /// context for detail it almost never needs, so shrinking is the default
+    /// and keeping every pixel is the thing you ask for.
+    #[serde(default)]
+    pub max_width: Option<u32>,
 }
+
+/// Widest image [`methods::TAKE_SCREENSHOT`] returns unless asked otherwise.
+///
+/// Downscaling is the only screenshot lever that matters: an image costs an
+/// agent tokens by its pixel dimensions, not by its file size, so a smaller
+/// picture is a cheaper picture and the encoding is beside the point.
+pub const DEFAULT_SCREENSHOT_MAX_WIDTH: u32 = 1400;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteActionParams {
@@ -328,6 +358,96 @@ pub struct GetFocusInfoParams {
     #[serde(default)]
     pub window_id: Option<String>,
 }
+
+/// Params for [`methods::WAIT_FOR`].
+///
+/// Every condition that is set must hold in the same painted frame. Setting
+/// none is legal and returns as soon as one frame has been painted — the way
+/// to ask for nothing but a settled frame.
+///
+/// This exists so an agent never has to spin: polling from the outside costs a
+/// model turn per attempt, while waiting here costs one frame callback.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WaitForParams {
+    /// Wait until an element with this id is in the painted frame. Accepts the
+    /// same full / global / suffix forms as everywhere else.
+    #[serde(default)]
+    pub element_id: Option<String>,
+    /// Wait until this text is painted anywhere in the window
+    /// (case-insensitive).
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Wait until this key context is on the focus chain (substring,
+    /// case-insensitive) — how you wait for a dialog or a mode to take over
+    /// the keyboard. Focus itself is reported as a `FocusHandle`, which is not
+    /// an element id, so there is nothing else here to match it against.
+    #[serde(default)]
+    pub key_context: Option<String>,
+    /// JSON pointer into the [`methods::GET_APP_STATE`] answer, e.g.
+    /// `/app/rows`. Without [`Self::app_state_equals`] the condition is "this
+    /// pointer resolves to something other than null".
+    #[serde(default)]
+    pub app_state_path: Option<String>,
+    /// The value [`Self::app_state_path`] must reach.
+    #[serde(default)]
+    pub app_state_equals: Option<serde_json::Value>,
+    /// Invert the whole predicate: wait until the conditions stop holding.
+    /// This is how you wait for a dialog to close or a spinner to go away.
+    #[serde(default)]
+    pub absent: bool,
+    /// Give up after this long, defaulting to [`DEFAULT_WAIT_MS`] and capped
+    /// at [`MAX_WAIT_MS`]. Giving up is not an error: the answer says
+    /// `satisfied: false`, which is a fact the caller may well have been
+    /// asking for.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
+
+/// How long [`methods::WAIT_FOR`] waits when no timeout is given.
+pub const DEFAULT_WAIT_MS: u64 = 3_000;
+
+/// Longest wait [`methods::WAIT_FOR`] accepts. The app answers one request at
+/// a time, so an unbounded wait would wedge every later call.
+pub const MAX_WAIT_MS: u64 = 30_000;
+
+/// Params for [`methods::BATCH`]: several methods in one request.
+///
+/// The point is turns, not milliseconds. Each step costs the agent a full
+/// model round trip when sent on its own; sent together they cost one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchParams {
+    /// Run in order, at most [`MAX_BATCH_STEPS`] of them.
+    pub steps: Vec<BatchStep>,
+    /// Stop at the first step that fails. Default `true` — a sequence usually
+    /// describes one intention, and continuing past a failed click means
+    /// typing into whatever happened to have focus instead.
+    #[serde(default = "default_true")]
+    pub stop_on_error: bool,
+    /// `window_id` for steps that do not name one themselves.
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
+
+/// One step of a [`BatchParams`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchStep {
+    /// Any method in [`methods::ALL`] except [`methods::BATCH`] itself.
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Most steps a single [`methods::BATCH`] may carry.
+pub const MAX_BATCH_STEPS: usize = 32;
+
+/// Deadline for a whole [`methods::BATCH`], however its steps divide it.
+pub const MAX_BATCH_MS: u64 = 45_000;
 
 #[cfg(test)]
 mod tests {
@@ -414,6 +534,84 @@ mod tests {
             let back: IpcResponse = serde_json::from_str(&json).unwrap();
             assert_eq!(back.id, r.id);
             assert_eq!(back.result.is_ok(), r.result.is_ok());
+        }
+    }
+
+    #[test]
+    fn wait_for_defaults_to_nothing_but_a_settled_frame() {
+        let params: WaitForParams = serde_json::from_str("{}").unwrap();
+        assert!(params.element_id.is_none());
+        assert!(params.text.is_none());
+        assert!(!params.absent);
+        assert!(params.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn wait_for_reads_a_full_condition() {
+        let params: WaitForParams = serde_json::from_str(
+            r#"{"element_id":"results","text":"Done","absent":true,"timeout_ms":500,"key_context":"Dialog",
+                "app_state_path":"/app/rows","app_state_equals":12}"#,
+        )
+        .unwrap();
+        assert_eq!(params.element_id.as_deref(), Some("results"));
+        assert_eq!(params.text.as_deref(), Some("Done"));
+        assert_eq!(params.key_context.as_deref(), Some("Dialog"));
+        assert!(params.absent);
+        assert_eq!(params.timeout_ms, Some(500));
+        assert_eq!(params.app_state_path.as_deref(), Some("/app/rows"));
+        assert_eq!(params.app_state_equals, Some(serde_json::json!(12)));
+    }
+
+    /// Continuing past a failed step is the dangerous default, so it must be
+    /// the one you ask for.
+    #[test]
+    fn batch_stops_on_error_unless_told_otherwise() {
+        let params: BatchParams =
+            serde_json::from_str(r#"{"steps":[{"method":"send_key","params":{"key":"enter"}}]}"#)
+                .unwrap();
+        assert!(params.stop_on_error);
+        assert_eq!(params.steps.len(), 1);
+        assert_eq!(params.steps[0].method, methods::SEND_KEY);
+
+        let params: BatchParams =
+            serde_json::from_str(r#"{"steps":[],"stop_on_error":false}"#).unwrap();
+        assert!(!params.stop_on_error);
+    }
+
+    #[test]
+    fn batch_step_params_are_optional() {
+        let step: BatchStep = serde_json::from_str(r#"{"method":"get_windows"}"#).unwrap();
+        assert!(step.params.is_null());
+    }
+
+    /// An old app receiving the new fields must still parse the request, and a
+    /// new app receiving an old request must still get the defaults.
+    #[test]
+    fn screenshot_params_stay_optional() {
+        let params: TakeScreenshotParams = serde_json::from_str("{}").unwrap();
+        assert!(params.max_width.is_none());
+
+        let params: TakeScreenshotParams = serde_json::from_str(r#"{"max_width":0}"#).unwrap();
+        assert_eq!(params.max_width, Some(0));
+    }
+
+    #[test]
+    fn screenshot_result_scale_is_optional() {
+        let result: ScreenshotResult =
+            serde_json::from_str(r#"{"path":"/tmp/a.png","width":10,"height":10,"format":"png"}"#)
+                .unwrap();
+        assert!(result.scale.is_none());
+    }
+
+    #[test]
+    fn every_method_is_listed_once() {
+        let mut all = methods::ALL.to_vec();
+        let before = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(before, all.len(), "a method appears twice in ALL");
+        for method in [methods::WAIT_FOR, methods::BATCH] {
+            assert!(methods::ALL.contains(&method), "{method} missing from ALL");
         }
     }
 

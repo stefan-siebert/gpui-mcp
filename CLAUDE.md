@@ -17,6 +17,10 @@ MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJS
   forwards each tool call as one IPC request on a fresh connection.
 - `src/protocol.rs` — `IpcRequest`/`IpcResponse`, `UiElement`, param structs,
   `methods::*` constants. Tool names == IPC method names.
+- `src/docs.rs` — what the server tells an agent about itself: the
+  `initialize` instructions, the `gpui_guide` tool, the guide resources and the
+  `onboard` prompt, all generated from one topic table. Server-local: no IPC
+  method, so the guide works with no app running. See PLAN.md for why.
 - The in-app side is **not** here: it is the `mcp` module/feature of
   [stefan-siebert/gpui-component](https://github.com/stefan-siebert/gpui-component),
   which depends on this repo by git (`package = "gpui-mcp-inspector"`, imports
@@ -31,8 +35,15 @@ MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJS
   `../gpui-component/crates/ui/src/mcp.rs` before removing or renaming anything.
 - Adding a tool: add the method constant and `methods::ALL` entry in
   `protocol.rs`, a params struct if needed, the JSON schema in `tools_list()`
-  in `main.rs`, the handler in gpui-component, and the row in README.md.
+  in `main.rs`, the handler in gpui-component, the row in README.md, and the
+  entry in the `tools` topic of `docs.rs` — a test fails until that last one
+  exists.
 - Docs and code comments in English.
+- `wait_for` and `batch` are answered asynchronously by the app (it waits for
+  frames); every other method is answered from the frame already painted. Input
+  methods answer only after the frame showing their effect — that is protocol
+  v2, and it is why the version was bumped despite the types staying
+  compatible.
 
 ## Commands
 
