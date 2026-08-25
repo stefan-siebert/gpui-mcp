@@ -190,11 +190,7 @@ impl GpuiMcpServer {
     ) -> Result<serde_json::Value> {
         let mut stream = self.connect()?;
 
-        let request = IpcRequest {
-            id: uuid::Uuid::new_v4().to_string(),
-            method: method.to_string(),
-            params,
-        };
+        let request = IpcRequest::new(uuid::Uuid::new_v4().to_string(), method.to_string(), params);
 
         let request_json = serde_json::to_string(&request)?;
         stream.write_all(request_json.as_bytes())?;
@@ -211,6 +207,18 @@ impl GpuiMcpServer {
 
         let response: IpcResponse =
             serde_json::from_str(&response_line).context("Failed to parse IPC response")?;
+
+        // The app is the half that gets rebuilt by a normal build, so a
+        // disagreement here almost always means *this* binary is the stale one
+        // — but name the app's remedy too, since only its owner knows which.
+        if let Some(complaint) = version_complaint(
+            response.protocol_version,
+            "GPUI app",
+            "rebuild the app (for Elane: `cargo xtask run`); if the app is current, \
+             rebuild this server with `cargo build --release` inside the gpui-mcp checkout",
+        ) {
+            anyhow::bail!(complaint);
+        }
 
         match response.result {
             Ok(value) => Ok(value),

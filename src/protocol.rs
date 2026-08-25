@@ -7,6 +7,47 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Version of the wire format in this module.
+///
+/// This crate has two consumers built at different times by different
+/// mechanisms: the `[lib]` is linked into the GPUI app (through
+/// `gpui_component::mcp`) and rebuilt whenever the app is, while the
+/// `[[bin]] gpui-mcp-server` is launched from `target/release/` by an MCP
+/// client and is rebuilt by nobody. Nothing forces the two to move together,
+/// so a change here can leave a fresh app talking to a months-old server.
+///
+/// **Bump this only when a change to the types below is not backward
+/// compatible** — a new `#[serde(default)]` field is not, a renamed or
+/// retyped field is. Bumping it for a compatible change costs everyone a
+/// rebuild for nothing.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// What a peer built before this handshake existed appears as: it sends no
+/// version at all, and `#[serde(default)]` reads that back as zero.
+pub const VERSION_UNKNOWN: u32 = 0;
+
+/// Explain a version disagreement to whoever is reading the error, or return
+/// `None` when the peer agrees with us.
+///
+/// `peer_label` names the half that needs rebuilding and `rebuild` is the
+/// command that does it — both sides of the socket call this, and each knows
+/// only the other's remedy.
+pub fn version_complaint(peer: u32, peer_label: &str, rebuild: &str) -> Option<String> {
+    if peer == PROTOCOL_VERSION {
+        return None;
+    }
+    let theirs = if peer == VERSION_UNKNOWN {
+        "predates the version handshake".to_string()
+    } else {
+        format!("speaks protocol v{peer}")
+    };
+    Some(format!(
+        "gpui-mcp protocol mismatch: the {peer_label} {theirs}, this side speaks \
+         v{PROTOCOL_VERSION}. They are built from one crate but by different \
+         mechanisms, so they can drift apart. Rebuild the {peer_label}: {rebuild}"
+    ))
+}
+
 /// A request from the MCP server to the GPUI app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcRequest {
@@ -14,6 +55,11 @@ pub struct IpcRequest {
     /// One of the constants in [`methods`].
     pub method: String,
     pub params: serde_json::Value,
+    /// Sender's [`PROTOCOL_VERSION`]. Defaulted so a peer that predates the
+    /// handshake deserializes as [`VERSION_UNKNOWN`] rather than failing to
+    /// parse — the whole point is to produce a *diagnosis*, not a parse error.
+    #[serde(default)]
+    pub protocol_version: u32,
 }
 
 /// The app's answer to an [`IpcRequest`], echoing its `id`.
@@ -21,6 +67,35 @@ pub struct IpcRequest {
 pub struct IpcResponse {
     pub id: String,
     pub result: Result<serde_json::Value, String>,
+    /// Sender's [`PROTOCOL_VERSION`]; see [`IpcRequest::protocol_version`].
+    #[serde(default)]
+    pub protocol_version: u32,
+}
+
+impl IpcRequest {
+    /// Build a request stamped with this build's [`PROTOCOL_VERSION`].
+    /// Constructing the struct literally is still possible but leaves the
+    /// stamp at [`VERSION_UNKNOWN`], which reads as "peer is ancient" on the
+    /// far side — prefer this.
+    pub fn new(id: String, method: String, params: serde_json::Value) -> Self {
+        Self {
+            id,
+            method,
+            params,
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+}
+
+impl IpcResponse {
+    /// Build a response stamped with this build's [`PROTOCOL_VERSION`].
+    pub fn new(id: String, result: Result<serde_json::Value, String>) -> Self {
+        Self {
+            id,
+            result,
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
 }
 
 /// One node of the element tree.
@@ -275,15 +350,65 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_that_agrees_is_silent() {
+        assert_eq!(
+            version_complaint(PROTOCOL_VERSION, "server", "(cd .. && cargo build)"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_peer_predating_the_handshake_is_named_as_such() {
+        let complaint = version_complaint(VERSION_UNKNOWN, "MCP server", "rebuild-me")
+            .expect("an unversioned peer must be reported");
+        assert!(
+            complaint.contains("predates the version handshake"),
+            "{complaint}"
+        );
+        assert!(complaint.contains("MCP server"), "{complaint}");
+        assert!(complaint.contains("rebuild-me"), "{complaint}");
+    }
+
+    #[test]
+    fn a_peer_on_another_version_is_named_with_its_number() {
+        let complaint = version_complaint(PROTOCOL_VERSION + 7, "app", "cargo xtask run")
+            .expect("a divergent peer must be reported");
+        assert!(
+            complaint.contains(&format!("v{}", PROTOCOL_VERSION + 7)),
+            "{complaint}"
+        );
+        assert!(complaint.contains("cargo xtask run"), "{complaint}");
+    }
+
+    #[test]
+    fn an_unstamped_peer_parses_as_version_unknown() {
+        // The handshake must survive contact with a build that predates it:
+        // the old wire format has no such field, and refusing to parse would
+        // turn a diagnosable mismatch back into a mystery.
+        let request: IpcRequest =
+            serde_json::from_str(r#"{"id":"1","method":"get_windows","params":null}"#).unwrap();
+        assert_eq!(request.protocol_version, VERSION_UNKNOWN);
+        let response: IpcResponse =
+            serde_json::from_str(r#"{"id":"1","result":{"Ok":null}}"#).unwrap();
+        assert_eq!(response.protocol_version, VERSION_UNKNOWN);
+    }
+
+    #[test]
+    fn constructors_stamp_the_current_version() {
+        let request = IpcRequest::new(
+            "1".into(),
+            methods::GET_WINDOWS.into(),
+            serde_json::json!({}),
+        );
+        assert_eq!(request.protocol_version, PROTOCOL_VERSION);
+        let response = IpcResponse::new("1".into(), Ok(serde_json::json!({})));
+        assert_eq!(response.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn ipc_response_roundtrip() {
-        let ok = IpcResponse {
-            id: "1".into(),
-            result: Ok(serde_json::json!({"success": true})),
-        };
-        let err = IpcResponse {
-            id: "2".into(),
-            result: Err("boom".into()),
-        };
+        let ok = IpcResponse::new("1".into(), Ok(serde_json::json!({"success": true})));
+        let err = IpcResponse::new("2".into(), Err("boom".into()));
         for r in [ok, err] {
             let json = serde_json::to_string(&r).unwrap();
             let back: IpcResponse = serde_json::from_str(&json).unwrap();
