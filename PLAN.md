@@ -177,14 +177,20 @@ Determinism rules to build in: never `sleep`, always `wait_for`; the window
 size is fixed by the script header; a defined start state via an `app_reset`
 hook analogous to the app-state provider.
 
-## Stage 4 — `a11y_audit`
+## Stage 4 — `a11y_audit` — **done, minus what cannot be seen**
 
-Runs over the semantic layer from stage 2 and reports: interactive elements
-without an accessible name, controls unreachable by keyboard, focus order and
-focus traps, contrast ratio from computed style against the background, target
-size below 24 px, duplicate `test_id`s. As an `audit:` step inside a replay
-script, accessibility becomes part of the regression suite instead of a
-one-off.
+Shipped: `unnamed-control`, `duplicate-id`, `target-too-small` and
+`zero-size-control`, ordered worst first, each naming the element, its id and
+gpui's source location. A failing audit fails a replay step, so accessibility
+is part of a regression run rather than a thing checked once.
+
+Not shipped, because the derived layer cannot see it: contrast (no colours on
+this side), keyboard reachability and focus traps (focus is a `FocusHandle`,
+not an element), and anything about state. Contrast and state need stage 2b;
+focus needs a per-element focus id, which is the same fork change.
+
+Found on gpui-component's own story app the first time it ran: nine unnamed
+controls, `#menu` naming four buttons, `#item` naming sixty-two list rows.
 
 ## Order
 

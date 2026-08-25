@@ -219,6 +219,21 @@ Start here. On a real UI this is a small fraction of the tree's size, and the
 `@ref` at the end of each line works as `element_id` in `click_element`,
 `wait_for`, `get_element` and `take_screenshot`.
 
+**`a11y_audit`** — `{}` or `{"fail_on": "warning"}`
+Checks the window for problems that hurt a screen-reader user and you equally:
+a control with no text (nothing can name it, and you have nothing to match on),
+an id that names several elements (a suffix match takes the first, so a script
+targeting it may act on the wrong one), a target below 24px, a control painted
+with no area. Each finding names the element, its id, and the source location
+gpui recorded for it — which for a gpui-component widget is the widget's own
+file, so it tells you *what* the element is; the id and the element path are
+what locate it in your code. It reads the same derived layer as the snapshot,
+so it cannot see colours and does not check contrast. Options:
+`root_element_id`,
+`fail_on` (`serious` by default, or `warning`, or `none`), `min_target_size`,
+`max_findings`. As a step in a recorded script, a failing audit fails the
+replay.
+
 **`inspect_ui_tree`** — `{"max_depth": 3, "format": "compact"}`
 The element hierarchy. Options: `max_depth` (0 = unlimited), `window_id`,
 `root_element_id` (start at a subtree), `element_type_filter` (substring of the
@@ -416,6 +431,23 @@ accept, which usually names the missing binding immediately.
 {"name": "inspect_ui_tree", "arguments": {"max_depth": 2, "format": "compact"}}
 {"name": "inspect_ui_tree", "arguments": {"root_element_id": "editor-pane", "max_depth": 3}}
 {"name": "get_element", "arguments": {"element_id": "editor-pane"}}
+```
+
+## Find out what is wrong with the UI
+
+```json
+{"name": "a11y_audit", "arguments": {}}
+```
+The findings are ordered worst first. Two of them are worth knowing before you
+write a script:
+a control with **no text** cannot be targeted by name, and an id that names
+**several** elements will make a click land on the first one. Both are fixed in
+the app, and fixing them makes it easier to drive as well as easier to hear.
+
+Put it in a script to keep it fixed:
+
+```json
+{"method": "a11y_audit", "params": {"fail_on": "serious"}}
 ```
 
 ## Check a value the app owns

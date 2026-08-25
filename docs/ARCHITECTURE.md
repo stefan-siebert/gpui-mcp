@@ -273,3 +273,40 @@ The plan lists three things a test suite eventually needs and this does not
 have: a pinned window size (layout, and therefore any golden image, depends on
 it), golden-screenshot comparison with a perceptual tolerance, and a defined
 starting state via an app-side reset hook. All three are additive.
+
+## The accessibility audit
+
+`a11y_audit` reads the derived layer the snapshot prints, which fixes both what
+it can find and what it cannot. It cannot check contrast: colours never reach
+this side. It cannot check what a control announces when its state changes:
+nothing here knows the state. Claiming otherwise would be worse than the gap.
+
+What it can see is the overlap between an accessibility problem and a targeting
+problem, and that overlap turns out to be most of what matters here:
+
+- **A control that paints no text** has no accessible name *and* nothing an
+  agent can match on. The icon-only button is the same bug for both readers.
+- **An id that names several elements** breaks the promise that an id
+  identifies something. A suffix match takes the first, so a recorded script
+  targeting `#item` clicks the first of sixty-two — quietly, and only in the
+  run where the order changed. This one was found the hard way: the recorder
+  hit it before the audit existed.
+- **A target under 24 px** (WCAG 2.2's minimum) is hard to hit with a shaky
+  hand, a finger, or a synthetic click at an element's centre.
+
+So the audit is not a side quest bolted onto a driving tool. **The same fix
+serves both readers**: give the element a label and its own id, and it becomes
+announceable and targetable in one move. That is also the fix the snapshot has
+been asking for since it started printing `#id`.
+
+A finding carries the source location gpui recorded, which is worth being
+precise about: for a gpui-component widget that is the *widget's* file, so it
+says what the element is, not where the app put it. The id and the element path
+are what locate it in the app's code. An earlier draft of this documentation
+called it "the line to change"; running the audit against a real app showed
+that to be wrong.
+
+Because a failing audit fails a replay step, accessibility becomes part of a
+regression run rather than something that was checked once. That reuses the
+same rule as `wait_for`: a step that reports it is not satisfied is a failed
+expectation, and no new vocabulary was needed to say so.

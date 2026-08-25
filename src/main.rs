@@ -651,6 +651,37 @@ fn tools_list() -> serde_json::Value {
                 }
             },
             {
+                "name": "a11y_audit",
+                "description": "Check the window for accessibility problems that are also targeting problems: a control with no text (nothing can name it, nothing can match on it), an id that names several elements (a suffix match takes the first, so a script targeting it may click the wrong one), a target below the 24px minimum, a control painted with no area. Each finding names the element, its id, and the source location gpui recorded — for a gpui-component widget that is the widget own file, so it says what the element is; the id and the element path are what locate it in your app. Reads the same derived layer ui_snapshot prints, so it cannot see colours and does not check contrast. As a step in a recorded script it fails the replay when findings reach fail_on, which is how this stays checked. Example: {\"fail_on\": \"serious\"}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to audit (default: active window)"
+                        },
+                        "root_element_id": {
+                            "type": "string",
+                            "description": "Audit this element's subtree instead of the whole window. Takes an id or a @ref."
+                        },
+                        "fail_on": {
+                            "type": "string",
+                            "enum": ["serious", "warning", "none"],
+                            "description": "Severity at which the audit reports ok:false. Default: serious."
+                        },
+                        "min_target_size": {
+                            "type": "number",
+                            "description": "Smallest acceptable side of an interactive element, in pixels. Default 24 (WCAG 2.2)."
+                        },
+                        "max_findings": {
+                            "type": "integer",
+                            "description": "Stop after this many findings. Default 50."
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "inspect_ui_tree",
                 "description": "Get the UI element hierarchy for debugging layout and structure. Each element has: id, element_type (derived from source file), bounds, source_location, children, properties. Use max_depth to limit tree size (default: unlimited). Use root_element_id to inspect a subtree instead of the whole app. Use format='compact' to strip verbose fields (bounds, content_mask, source_location, content_size). WARNING: Without filters this can return very large responses. Example: {\"max_depth\": 3, \"format\": \"compact\"}",
                 "inputSchema": {

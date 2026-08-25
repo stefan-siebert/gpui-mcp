@@ -224,6 +224,7 @@ pub struct Modifiers {
 pub mod methods {
     // Inspection
     pub const UI_SNAPSHOT: &str = "ui_snapshot";
+    pub const A11Y_AUDIT: &str = "a11y_audit";
     pub const INSPECT_UI_TREE: &str = "inspect_ui_tree";
     pub const GET_ELEMENT: &str = "get_element";
     pub const GET_WINDOWS: &str = "get_windows";
@@ -247,6 +248,7 @@ pub mod methods {
     pub const ALL: &[&str] = &[
         GET_WINDOWS,
         UI_SNAPSHOT,
+        A11Y_AUDIT,
         INSPECT_UI_TREE,
         GET_ELEMENT,
         GET_FOCUS_INFO,
@@ -394,6 +396,41 @@ pub struct UiSnapshotParams {
 
 /// How many elements a snapshot returns unless asked for more.
 pub const DEFAULT_SNAPSHOT_ELEMENTS: usize = 200;
+
+/// Params for [`methods::A11Y_AUDIT`].
+///
+/// The audit reads the same derived layer [`methods::UI_SNAPSHOT`] prints, so
+/// it can only report what that layer can see. That is less than a browser
+/// accessibility checker and more than nothing: an unnamed control, an id that
+/// identifies several elements, a target too small to hit. Contrast is not
+/// among them — the colours never reach this side.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct A11yAuditParams {
+    #[serde(default)]
+    pub window_id: Option<String>,
+    /// Audit this element's subtree instead of the whole window.
+    #[serde(default)]
+    pub root_element_id: Option<String>,
+    /// Severity at which the audit reports `ok: false`: `"serious"` (default),
+    /// `"warning"`, or `"none"` to always pass. A replay step fails when the
+    /// audit does, which is how accessibility becomes part of a regression run
+    /// rather than a thing somebody remembers to check.
+    #[serde(default)]
+    pub fail_on: Option<String>,
+    /// Smallest acceptable side of an interactive element, in pixels.
+    /// Default [`DEFAULT_MIN_TARGET_SIZE`], WCAG 2.2's minimum.
+    #[serde(default)]
+    pub min_target_size: Option<f32>,
+    /// Stop after this many findings. Default [`DEFAULT_MAX_FINDINGS`].
+    #[serde(default)]
+    pub max_findings: Option<usize>,
+}
+
+/// WCAG 2.2 "Target Size (Minimum)", in pixels.
+pub const DEFAULT_MIN_TARGET_SIZE: f32 = 24.0;
+
+/// How many findings an audit returns unless asked for more.
+pub const DEFAULT_MAX_FINDINGS: usize = 50;
 
 /// Params for [`methods::WAIT_FOR`].
 ///

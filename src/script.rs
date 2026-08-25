@@ -43,6 +43,7 @@ pub struct Step {
 /// Tools that describe the app rather than change it. A `seek` replay skips
 /// them: re-reading the tree on the way to a state is pure cost.
 pub const READ_ONLY: &[&str] = &[
+    "a11y_audit",
     "get_windows",
     "get_app_state",
     "get_logs",
@@ -367,6 +368,16 @@ fn unmet_expectation(method: &str, value: &serde_json::Value) -> Option<String> 
             value.get("ran").unwrap_or(&serde_json::json!(0)),
             value.get("of").unwrap_or(&serde_json::json!(0))
         )),
+        // An audit step in a script is an assertion about the UI, the same way
+        // a wait is an assertion about its state.
+        "a11y_audit" if value.get("ok") == Some(&serde_json::json!(false)) => Some(format!(
+            "{} serious and {} warnings, at fail_on={}",
+            value.get("serious").unwrap_or(&serde_json::json!(0)),
+            value.get("warnings").unwrap_or(&serde_json::json!(0)),
+            value
+                .get("fail_on")
+                .unwrap_or(&serde_json::json!("serious"))
+        )),
         _ => None,
     }
 }
@@ -501,6 +512,98 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    fn script_of(steps: &[(&str, serde_json::Value)]) -> Script {
+        Script {
+            name: "test".into(),
+            app: None,
+            recorded_with: None,
+            steps: steps
+                .iter()
+                .map(|(method, params)| Step {
+                    method: (*method).to_string(),
+                    params: params.clone(),
+                    note: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_replay_reports_every_step() {
+        let script = script_of(&[
+            ("click_element", json!({ "element_id": "save" })),
+            ("wait_for", json!({ "text": "Saved" })),
+        ]);
+
+        let report = replay(&script, &ReplayOptions::default(), |method, _params| {
+            Ok(match method {
+                "wait_for" => json!({ "satisfied": true }),
+                _ => json!({ "success": true }),
+            })
+        });
+
+        assert!(report.ok);
+        assert_eq!((report.passed, report.failed, report.skipped), (2, 0, 0));
+    }
+
+    /// A `wait_for` that never came true is a failed assertion. That is the
+    /// whole test story: no separate step type, and the failure already says
+    /// which condition did not hold.
+    #[test]
+    fn an_unsatisfied_wait_fails_the_replay() {
+        let script = script_of(&[
+            ("wait_for", json!({ "text": "Saved" })),
+            ("send_key", json!({ "key": "enter" })),
+        ]);
+
+        let report = replay(
+            &script,
+            &ReplayOptions {
+                seek: false,
+                stop_on_error: true,
+            },
+            |_, _| {
+                Ok(json!({
+                    "satisfied": false,
+                    "waited_ms": 3000,
+                    "checks": { "text": { "found": false } }
+                }))
+            },
+        );
+
+        assert!(!report.ok);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.steps.len(), 1, "stopped at the failure");
+        let detail = report.steps[0].detail.as_deref().unwrap();
+        assert!(detail.contains("3000"), "{detail}");
+        assert!(detail.contains("found"), "{detail}");
+    }
+
+    #[test]
+    fn keeping_going_runs_the_rest() {
+        let script = script_of(&[
+            ("wait_for", json!({ "text": "nope" })),
+            ("send_key", json!({ "key": "enter" })),
+        ]);
+
+        let report = replay(
+            &script,
+            &ReplayOptions {
+                seek: false,
+                stop_on_error: false,
+            },
+            |method, _| {
+                Ok(match method {
+                    "wait_for" => json!({ "satisfied": false }),
+                    _ => json!({ "success": true }),
+                })
+            },
+        );
+
+        assert_eq!((report.passed, report.failed), (1, 1));
+        assert_eq!(report.steps.len(), 2);
+    }
+
     #[test]
     fn the_guide_and_replay_are_not_recorded() {
         let path = temp_path("skip");
@@ -516,5 +619,79 @@ mod tests {
 
         assert_eq!(recorder.steps(), 1);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Seeking is about arriving, not about checking the way there.
+    #[test]
+    fn seeking_skips_the_steps_that_only_look() {
+        let script = script_of(&[
+            ("ui_snapshot", json!({})),
+            ("inspect_ui_tree", json!({})),
+            ("take_screenshot", json!({})),
+            ("click_element", json!({ "element_id": "save" })),
+        ]);
+
+        let mut called = Vec::new();
+        let report = replay(
+            &script,
+            &ReplayOptions {
+                seek: true,
+                stop_on_error: true,
+            },
+            |method, _| {
+                called.push(method.to_string());
+                Ok(json!({ "success": true }))
+            },
+        );
+
+        assert_eq!(report.skipped, 2, "the tree and the screenshot");
+        assert_eq!(called, ["ui_snapshot", "click_element"]);
+    }
+
+    /// A snapshot is not skipped: it hands out the refs a later step may need.
+    #[test]
+    fn a_snapshot_is_not_a_read_only_step() {
+        assert!(!is_read_only("ui_snapshot"));
+        assert!(is_read_only("inspect_ui_tree"));
+        assert!(is_read_only("take_screenshot"));
+        assert!(is_read_only("a11y_audit"), "seeking does not audit");
+        assert!(!is_read_only("click_element"));
+    }
+
+    /// An audit step is an assertion about the UI, the same way a wait is one
+    /// about its state — so accessibility stays checked rather than having
+    /// been checked once.
+    #[test]
+    fn a_failing_audit_fails_the_replay() {
+        let script = script_of(&[("a11y_audit", json!({ "fail_on": "serious" }))]);
+
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Ok(json!({ "ok": false, "serious": 3, "warnings": 7, "fail_on": "serious" }))
+        });
+
+        assert!(!report.ok);
+        let detail = report.steps[0].detail.as_deref().unwrap();
+        assert!(detail.contains('3'), "{detail}");
+        assert!(detail.contains('7'), "{detail}");
+    }
+
+    #[test]
+    fn an_audit_that_passes_passes() {
+        let script = script_of(&[("a11y_audit", json!({}))]);
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Ok(json!({ "ok": true, "serious": 0, "warnings": 4 }))
+        });
+        assert!(report.ok);
+    }
+
+    #[test]
+    fn a_failed_call_fails_the_step() {
+        let script = script_of(&[("click_element", json!({ "element_id": "nope" }))]);
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Err(anyhow::anyhow!("Element not found: nope"))
+        });
+
+        assert!(!report.ok);
+        assert!(report.steps[0].detail.as_deref().unwrap().contains("nope"));
     }
 }

@@ -170,6 +170,7 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `get_windows` | open windows with id, title, bounds, active flag — the window ids the other tools take |
 | `ui_snapshot` | the window as one short line per meaningful element — `role "name" #test-id @ref` — with the layout scaffolding dropped. Start here: on a real UI it is a fraction of the tree's size |
 | `get_app_state` | window overview plus whatever the app's state provider returns (`app` key) |
+| `a11y_audit` | controls nothing can name, ids that name several elements, targets under 24px — the problems that hurt a screen-reader user and a script equally |
 | `inspect_ui_tree` | the element hierarchy: id, type (from the source file), bounds, `source_location`, children, text. Filters: `max_depth`, `window_id`, `root_element_id`, `element_type_filter`, `text_filter`, `format: compact` |
 | `get_element` | one element with its full subtree |
 | `get_focus_info` | the focus handle and the active key-context chain — the first thing to check when a key binding does not fire |
@@ -249,6 +250,42 @@ generated from one table in `src/docs.rs`:
 
 A test asserts that every method in `methods::ALL` appears in the `tools`
 topic, so a new tool cannot ship undocumented.
+
+## The accessibility audit
+
+`a11y_audit` reads the same derived layer the snapshot prints and reports the
+problems it can actually see:
+
+| check | severity | what it means |
+|---|---|---|
+| `unnamed-control` | serious | an interactive element that paints no text. A screen reader has nothing to announce, and nothing can target it by name |
+| `duplicate-id` | serious on a control, else warning | one id names several elements. A suffix match takes the first, so a click or a recorded script may act on the wrong one |
+| `target-too-small` | warning | an interactive element with a side under `min_target_size`, 24px by default (WCAG 2.2) |
+| `zero-size-control` | serious | an interactive element painted with no area at all |
+
+Run against gpui-component's own story app it finds nine unnamed controls (all
+the icon-only buttons in the title bar, and the search field), that `#menu`
+names four buttons, and that `#item` names sixty-two list rows.
+
+That last one is why this is not only an accessibility feature: a recorded
+script targeting `#item` clicks the first of sixty-two, quietly, and only in
+the run where the order changed. **The same fix serves both readers** — give
+the element its own id and a label, and it becomes both announceable and
+targetable.
+
+Findings are ordered worst first and carry the element, its id, and the source
+location gpui recorded. Note what that location is: for a gpui-component widget
+it is the widget's own file, so it says *what* the element is rather than where
+your app put it. The id and the element path are what locate it in your code.
+
+Contrast is not checked, and cannot be: colours never reach this side.
+
+As a step in a recorded script, a failing audit fails the replay — which is how
+this stays checked instead of having been checked once:
+
+```json
+{ "method": "a11y_audit", "params": { "fail_on": "serious" } }
+```
 
 ## Recording and replay
 
