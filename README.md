@@ -210,9 +210,9 @@ snapshot prints as `#results`.
 
 ```
 ui_snapshot 4 — WindowId(1v1), 9 of 96 painted elements
-- button #github @e1
-- button #menu @e2
-- textbox #input-4294967299 @e9
+- button #github @e1 ✓
+- button "Edit" #menu @e2 ✓
+- textbox #input-4294967299 @e9 value="" ✓
 ```
 
 An element earns a line by having a role, an id somebody chose, or text;
@@ -222,8 +222,22 @@ file name *is* the role, so `button/button.rs` renders a `button` and an app
 gets that vocabulary without annotating anything. A role that describes a
 region (`banner`, `list`, `dialog`, …) is only used when the element actually
 contains something, because one file paints both a title bar and its close
-button. Widgets an app writes itself have no role yet and appear by id and
-text; explicit annotations are the next step.
+button.
+
+**A `✓` means the line came from the accessibility tree**, not from that
+guess. Where an element has a node, its declared role wins over the derived
+one, its label supplies a name when nothing is painted (which is how `#menu`
+above got `"Edit"`), and its state is appended: `checked`, `selected`,
+`expanded`, `value="…"`. The marker is there because a role a widget declared
+and a role inferred from a file name are not the same claim, and an agent
+deciding what to trust should be able to see which it got. On the
+gpui-component gallery 10 of 91 lines carry it — most of a normal UI is not
+annotated, and the derived layer is what still sees the rest.
+
+Because of that, `ui_snapshot` and `a11y_audit` switch the window into
+building its accessibility tree and wait one frame the first time they run
+against it. Otherwise what they reported would depend on whether something
+else had switched it on first.
 
 Each `@ref` is shorthand for "the thing on that line of the snapshot I just
 showed you", and the next snapshot replaces the whole set — a stale ref fails
@@ -286,6 +300,15 @@ your app put it. The id and the element path are what locate it in your code.
 
 Contrast is not checked, and cannot be: colours never reach this side.
 
+The audit reads the accessibility tree wherever it reaches, which changes two
+things. `unnamed-control` now says *which* fix applies — an element with a
+node needs an `.aria_label(...)`, one without needs a `.role(...)` first, and
+telling the second to add a label is advice that cannot work. And the answer
+carries `announced` beside `checked` (10 of 91 on the gallery): how much of
+the window a screen reader can see at all. That is a count rather than a
+finding per element on purpose — 81 findings saying "no node" would bury the
+handful that name a real defect, and a number cannot be tuned out.
+
 As a step in a recorded script, a failing audit fails the replay — which is how
 this stays checked instead of having been checked once:
 
@@ -316,17 +339,23 @@ The catch is coverage. GPUI builds a node only for elements somebody
 annotated, and against the gpui-component gallery that is **11 nodes over 96
 painted elements** — the sidebar's sixty-two rows have none. So the tree is
 not a smaller snapshot, it is a different, sparser view, and the answer says
-`nodes` against `painted` so that is visible rather than assumed. Use
-`ui_snapshot` to see the window and `a11y_tree` to see what the annotated part
-of it announces. Each node carries `element_id` and `source_location`, which
-is how a node is matched to a snapshot line.
+`nodes` against `painted` so that is visible rather than assumed.
+
+Most of the time you do not need this tool: `ui_snapshot` already folds the
+tree into its lines, marking them `✓` and appending state. Reach for
+`a11y_tree` when you want the full node — description, keyboard shortcut,
+position-in-set, the exact AccessKit role — or when you want to see the
+structure a screen reader walks rather than the one the elements form. The two
+line up exactly: gpui derives a node's id from the same `GlobalElementId` the
+element path comes from, so the join is by identity, not by geometry or name.
 
 GPUI builds the tree only while assistive technology is attached, which is
-right for a shipping app and useless for checking one. The call therefore
-switches the window into building it and waits a frame — so the first
-`a11y_tree` on a window costs one frame more than the ones after it. This
-needs `Window::set_a11y_force_active`, which lives in the gpui fork this
-project builds against.
+right for a shipping app and useless for checking one. Reading it therefore
+switches the window into building it and waits a frame — which is why the
+first `a11y_tree`, `ui_snapshot` or `a11y_audit` against a window costs one
+frame more than the ones after it. This needs
+`Window::set_a11y_force_active`, which lives in the gpui fork this project
+builds against.
 
 ## Recording and replay
 

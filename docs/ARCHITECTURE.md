@@ -350,3 +350,57 @@ snapshot line by name. An earlier reading of this design assumed the only
 available join was bounds-against-bounds, which would have been fuzzy enough to
 matter. It is worth noting that this per-node provenance is `debug_assertions`
 only — as is the whole inspector, so nothing is lost.
+
+## Folding the tree into the snapshot
+
+The snapshot keeps the spine and the tree overlays it. That order is not a
+preference — it is what the numbers force. Eleven annotated nodes cannot
+describe a window of ninety-six painted elements, and the derived layer is
+what still sees the other eighty-five. Where a node does exist it wins on
+role, because a role the widget declared beats one inferred from the file that
+rendered it; it supplies a name when nothing is painted; and it contributes
+state, which the derived layer was never able to reach at all.
+
+**The join had to be exact, and the obvious key is not.** A node records the
+leaf of its element id and its source location. The gallery's four title-bar
+buttons are all `Name("menu")` from `button.rs:231:19` — matching on that pair
+picks one of the four at random, which is precisely the failure `duplicate-id`
+exists to report, committed by the tool that reports it. What makes it exact
+is that gpui derives a node's AccessKit id by hashing the element's whole
+`GlobalElementId`, so the fork puts that id on `InspectorElementInfo` and the
+two sides are joined by identity. The value is computed once, inside gpui, and
+only read here — nothing on this side re-hashes anything, so nothing depends
+on a hasher staying stable across versions. Checked by set intersection
+against a real window: every node matches exactly one element.
+
+**A declared fact and an inferred one are marked apart.** A line backed by a
+node ends in `✓`. It would have been easy to let the better data win silently,
+and wrong: an agent that cannot tell an announced role from a guessed one
+cannot calibrate how much to trust a line, and the audit's whole argument is
+that annotating is worth doing — which is invisible if the snapshot hides who
+has and has not.
+
+**An unmapped role changes nothing.** AccessKit roles are translated into the
+vocabulary the snapshot already prints, and a role missing from that table
+leaves the derived one in place rather than printing a second spelling.
+`filter`, `interactive_only` and the audit all match on those strings; two
+spellings of "button" would quietly halve every one of them.
+
+**Reading the tree is switched on by the reader.** `ui_snapshot` and
+`a11y_audit` force the window into building a tree and wait one frame the
+first time, which makes both asynchronous — a real cost on the two most-used
+methods. The alternative was worse: findings that depend on whether something
+else happened to call `a11y_tree` first is hidden state, and an audit that
+reports differently on two identical runs is worse than one with less data.
+
+**A missing node is counted, not reported.** The design sketch had an
+"unreachable control" finding for an interactive element with no node.
+Measuring killed it twice over: it would have fired eighty-one times on the
+gallery, and it would have found nothing, because every interactive element
+there already has a node and an app's own clickable `div` has no derived role
+for the check to see either. What shipped instead is `announced` beside
+`checked` in the answer — one number, which cannot be tuned out — and a
+split in `unnamed-control`, which now tells an element with a node to add a
+label and an element without one to add a role first. The second is the
+important half: telling something with no node to "add a label" is advice that
+cannot work.

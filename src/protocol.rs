@@ -126,6 +126,19 @@ pub struct UiElement {
     /// Text painted within this element's bounds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub text_content: Vec<String>,
+    /// The AccessKit node id this element's accessibility node would carry.
+    ///
+    /// gpui derives it from the same `GlobalElementId` the element path comes
+    /// from, so it is the exact join between this tree and the one
+    /// [`methods::A11Y_TREE`] returns — a node records only the *leaf* of its
+    /// element id and its source location, and four title-bar buttons can
+    /// share both. Zero when the app side is older than this field.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub accesskit_node_id: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

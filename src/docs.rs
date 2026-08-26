@@ -35,10 +35,11 @@ gpui-mcp drives a running GPUI app: read the element tree, click, type, press ke
 named actions, take screenshots.
 
 Start: (1) `ui_snapshot` — one short line per meaningful element, each ending in a `@ref` you can \
-act on. This is the cheap way to see a window; `inspect_ui_tree` is for layout questions and is \
-huge unfiltered. (2) `get_windows` when you need window ids; every tool defaults to the active \
-window. (3) drive it, preferring `execute_action` over `send_key` over `click_element` — actions \
-are named, stable and independent of layout.
+act on (a trailing `✓` = declared by the app, not inferred). This is the cheap way to see a \
+window; `inspect_ui_tree` is for layout questions and is huge unfiltered. (2) `get_windows` when \
+you need window ids; every tool defaults to the active window. (3) drive it, preferring \
+`execute_action` over `send_key` over `click_element` — actions are named, stable and independent \
+of layout.
 
 Spend calls, not turns. `batch` runs several tools in one call and `wait_for` waits inside the app \
 until a condition holds, so click, type, enter, wait is ONE call rather than four. Never poll by \
@@ -215,6 +216,13 @@ your app's widgets appear by their id and their text. Options: `filter`
 (role/name/test-id substring, ancestors kept), `interactive_only`,
 `root_element_id`, `max_elements` (default 200), `include_bounds`.
 
+A `✓` at the end of a line means it came from the app's accessibility tree
+rather than from the file-name guess: the role was declared, the name may be a
+label the element announces without painting it, and any state follows —
+`checked`, `unchecked`, `selected`, `expanded`, `value="…"`. Lines without it
+are derived, and a derived role is an inference, not a promise. Most of a
+normal UI is unannotated, so most lines have no `✓`.
+
 Start here. On a real UI this is a small fraction of the tree's size, and the
 `@ref` at the end of each line works as `element_id` in `click_element`,
 `wait_for`, `get_element` and `take_screenshot`.
@@ -229,8 +237,11 @@ next app start), a target below 24px, a control painted with no area. Each
 finding names the element, its id, and the source location gpui recorded for it
 — which for a gpui-component widget is the widget's own file, so it tells you
 *what* the element is; the id and the element path are what locate it in your
-code. It reads the same derived layer as the snapshot, so it cannot see colours
-and does not check contrast. Options: `root_element_id`,
+code. It reads the same layers the snapshot prints — derived roles, plus the
+accessibility tree wherever it reaches — so it cannot see colours and does not
+check contrast. `announced` beside `checked` says how much of the window has a
+node at all, and `unnamed-control` says which fix applies: an element with a
+node needs a label, one without needs a role first. Options: `root_element_id`,
 `fail_on` (`serious` by default, or `warning`, or `none`), `min_target_size`,
 `max_findings`. As a step in a recorded script, a failing audit fails the
 replay.
@@ -243,12 +254,12 @@ the actions each node offers (`Click`, `Focus`, `SetValue`). GPUI builds this
 tree only while assistive technology is attached, so the call turns it on for
 the window and waits a frame.
 
-It does not replace `ui_snapshot`. Only elements somebody annotated get a
-node — on the gpui-component gallery, eleven of ninety-six painted elements —
-and the answer says so, with `nodes` against `painted`. Use it to see what the
-annotated elements announce, and the snapshot to see everything. Each node
-carries `element_id` and `source_location`, which is how a node lines up with
-a snapshot line.
+It does not replace `ui_snapshot`, which already folds this tree into its
+lines — marking them `✓` and appending state. Reach for `a11y_tree` when you
+want a whole node: description, keyboard shortcut, position in set, the exact
+AccessKit role, the children a screen reader walks. Only annotated elements
+have one — on the gpui-component gallery, eleven of ninety-six painted
+elements — and the answer says so, with `nodes` against `painted`.
 
 **`inspect_ui_tree`** — `{"max_depth": 3, "format": "compact"}`
 The element hierarchy. Options: `max_depth` (0 = unlimited), `window_id`,
@@ -390,8 +401,8 @@ ui_snapshot 4 — WindowId(1v1), 47 of 318 painted elements
   - listitem "Accordion" #item @e3
   - listitem "Alert" #item @e4
 - group #gallery-container @e5
-  - button "Save" #save-button @e6
-  - textbox #search @e7
+  - button "Save" #save-button @e6 ✓
+  - textbox #search @e7 value="" ✓
 ```
 Narrow it when the window is busy: `{"interactive_only": true}` for what can be
 clicked, `{"filter": "save"}` for one thing, `{"root_element_id": "@e5"}` for

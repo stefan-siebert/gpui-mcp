@@ -16,7 +16,7 @@ is a reader for it rather than a design of our own.
 | 1 | frame-synchronous answers, `wait_for`, `batch` | done, protocol v2 |
 | 2a | `ui_snapshot`, roles derived from the source file, refs | done |
 | 2b | annotations: real roles, labels, values, state | done via upstream AccessKit + `a11y_tree` |
-| 2c | folding the a11y tree into the snapshot and the audit | open, and now decidable |
+| 2c | folding the a11y tree into the snapshot and the audit | done |
 | 3a | recording a session, replaying it, the `replay` CLI | done |
 | 3b | pinned window size, golden screenshots, an app-side reset hook | open |
 | 4 | `a11y_audit`, and a failing audit failing a replay | done, minus what the derived layer cannot see |
@@ -59,59 +59,58 @@ and is set only by AccessKit's own callbacks.
 - `a11y_tree`, answered asynchronously: it switches the window into building
   the tree, waits a frame, and returns it with `nodes` against `painted`.
 
-### The decision 2c is waiting on — with the evidence
+### What 2c settled, and what the evidence said
 
 Whether the a11y tree replaces the derived layer or overlays it. Run against
-the gallery, the answer is legible:
+the gallery, the answer was legible, and one part of it was wrong in this
+plan's first reading:
 
 - **11 nodes over 96 painted elements.** The sidebar's sixty-two rows have no
-  node at all. The tree cannot be the spine; it is the sparser view.
+  node at all. The tree cannot be the spine; it is the sparser view. So: an
+  overlay.
 - **It knows what the derived layer cannot.** The four buttons `duplicate-id`
   reports as `#menu` are `GPUI Component`, `Edit`, `Window` and `Help` in the
   tree — none of them paints text, so 2a had nothing to tell them apart. The
   search field carries `role: TextInput`, `value: ""`,
   `on_action: [Focus, SetValue]`.
-- **The join is free.** Nodes carry `element_id` (`Name("menu")`,
-  `NamedInteger("input", 4294967299)`) and `source_location`. No geometry
-  matching is needed — the worry this plan recorded was unfounded.
+- **The join was *not* free, and the fix was small.** This plan first recorded
+  that nodes carry `element_id` and `source_location` and that no geometry
+  matching would be needed. Both facts are true and neither is enough: the
+  four `#menu` buttons share *both*, so matching on them picks one of four at
+  random — the exact class of bug `duplicate-id` exists to report. What makes
+  it exact is that gpui derives a node's id from the element's
+  `GlobalElementId`, so a second fork line puts that id on
+  `InspectorElementInfo` and the join is by identity. Verified by set
+  intersection against the gallery: all ten nodes match, none ambiguous.
 - **`NamedInteger("input", 4294967299)`** is `unstable-id` seen from the other
   side: gpui itself prints the entity number as a separate field.
 
-So 2c is an overlay, not a replacement: `ui_snapshot` keeps the spine and takes
-role, name, value and state from the node where one exists; `a11y_audit` gains
-the checks that were listed as unshippable — state, and a control that is
-focusable with no node (which gpui already logs about). Contrast stays out:
-colours never reach this side.
+**What shipped.** Where an element has a node, its declared role wins over the
+derived one, its label supplies a name when nothing is painted, and its state
+is appended — `checked`, `unchecked`, `selected`, `expanded`, `value="…"`. The
+line ends in `✓`, because a role a widget declared and a role inferred from a
+file name are not the same claim and an agent should be able to see which it
+got. An AccessKit role with no entry in the mapping table leaves the derived
+role alone rather than introducing a second vocabulary: `filter`,
+`interactive_only` and the audit all match on those strings.
 
-Worth deciding with it: whether a missing node becomes an audit finding. Only
-11 of 96 elements have one, so the check would fire on most of a normal UI —
-the same shape of finding as `unnamed-control`, and the same risk of being
-tuned out.
+`ui_snapshot` and `a11y_audit` now switch the window into building the tree
+and wait a frame the first time, which makes them asynchronous. That cost buys
+the alternative away: otherwise what the audit reported would depend on
+whether something else had called `a11y_tree` first.
 
-### Loose ends — closed
+**The question about a missing node, answered by measuring.** A per-element
+finding would have fired 81 times on the gallery. Worse, it would have fired
+*nowhere useful*: every one of the nine interactive elements already has a
+node, and an app's own clickable `div` has no derived role either, so the
+check could not see it. So there is no such finding. The audit reports
+`announced` beside `checked` instead, and `unnamed-control` splits into two
+messages — an element with a node needs a label, one without needs a role
+first, and telling the second to add a label is advice that cannot work.
 
-Both were the same problem: an id that will not mean tomorrow what it means
-today.
-
-- **`unstable-id`**, a fifth audit check. `#input-4294967299` carries an entity
-  number that is fresh on every app start, and it is the one bad id the derived
-  layer cannot tell apart from a good one — lowercase, dashed, every bit as
-  deliberate-looking as `#save-button`. The line is drawn at six trailing
-  digits, so `item-3`, `row-42` and `since-2024` survive. Reported once per id
-  rather than once per element: sixty rows sharing a generated id are one
-  problem with one fix. A warning, not serious — nothing is broken for anyone
-  using the app right now; what breaks is everything written down against it.
-- **The recorder says so at record time.** It already warned when a `@ref`
-  pointed at a repeated id. It now also warns when a step *names* an id itself
-  that the last snapshot printed on several lines — the gap, since such a step
-  never went through the ref machinery — and when the id going into the file
-  ends in a generated number. The audit reports both about the app, later, if
-  anyone runs it. The note reports them about *this step*, while whoever is
-  recording it can still click something else or go and name it.
-
-The heuristic lives in `protocol.rs` (`id_looks_generated`, `GENERATED_ID_DIGITS`)
-so both halves agree on what "generated" means instead of guessing it the same
-way twice.
+**Still not shipped:** contrast (colours never reach this side, and never
+will). `disabled` is not among the fields gpui writes to a node, so despite
+what stage 2b's original sketch promised, it is not available from here.
 
 ### Verifying a change by hand
 
@@ -259,18 +258,19 @@ annotated the element, which on the gallery is 11 of 96 painted elements. The
 derived layer of 2a is therefore not superseded — it is what still sees the
 other 85. Folding the two together is 2c.
 
-### 2c — fold the tree into the snapshot and the audit — open
+### 2c — fold the tree into the snapshot and the audit — **done**
 
-`ui_snapshot` keeps the spine and takes role, name, value and state from a
-node where one exists, falling back to the derived guess where none does.
-`a11y_audit` gains state-aware checks and can report a focusable control with
-no node. The join key is `element_id` plus `source_location`; no geometry
-matching is needed.
+`ui_snapshot` keeps the spine and takes role, name and state from the node
+where one exists, falling back to the derived guess where none does. A line
+backed by a node ends in `✓`. `a11y_audit` reads the same overlay: it reports
+`announced` beside `checked`, and `unnamed-control` names the fix that
+actually applies.
 
-Two things to settle when it is built: whether a missing node is a finding at
-all — it would fire on most of a normal UI — and whether a snapshot line
-should say where its facts came from, since a derived role and an announced
-one are not the same claim.
+The join is `InspectorElementInfo::accesskit_node_id`, which gpui derives from
+the element's `GlobalElementId` — not the node's own leaf element id and
+source location, which the gallery's four title-bar buttons share. See *What
+2c settled* above for the measurements, including why a "no accessibility
+node" finding was measured and then not built.
 
 ## Stage 3 — Record and replay — **3a done**
 
@@ -336,11 +336,12 @@ element, its id and gpui's source location. A failing audit fails a replay
 step, so accessibility is part of a regression run rather than a thing checked
 once.
 
-Not shipped, because the derived layer cannot see it: contrast (no colours on
-this side), keyboard reachability and focus traps, and anything about state.
-Contrast stays out for good. State and focus do not: the a11y tree carries
-both — `selected`, `toggled`, `value`, and a node-to-focus-handle mapping — so
-they arrive with 2c rather than needing a fork change of their own.
+State arrived with 2c: the snapshot the audit reads now carries `checked`,
+`selected`, `expanded` and an input's value wherever an element has an
+accessibility node, and the audit reports how many do. Contrast is still not
+checked and never will be — colours never reach this side. Keyboard
+reachability and focus traps are still open: gpui maps a node to a
+`FocusHandle`, but nothing here reads that mapping yet.
 
 First run against the gpui-component gallery (upstream's demo, borrowed as a
 test subject): nine unnamed controls, `#menu` naming four buttons, `#item`
