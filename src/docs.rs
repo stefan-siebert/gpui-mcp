@@ -344,6 +344,34 @@ is the cheapest ground truth available — much cheaper than a tree or an image.
 The in-app log buffer, up to 500 entries. The MCP module logs every dispatch
 it performs, so this shows what actually happened on the app side.
 
+**`set_viewport`** — `{"width": 1280, "height": 800}`
+Resize a window to an exact content size and answer after the frame that shows
+it. A window's size decides its layout — a sidebar collapses, a toolbar folds
+into a menu — so a script recorded at one size and replayed at another is not
+replaying the same UI. Recorded scripts carry a `viewport` and replay applies
+it before the first step. The answer says what size was actually reached and
+whether the request was `honoured`: a platform may impose a minimum, or refuse
+while maximised.
+
+**`reset_app`** — `{}`
+Put the app back into a known starting state, by calling the hook it
+registered with `mcp_set_reset_hook`. This is the half of determinism only the
+app can supply: pinning the window makes layout reproducible, but nothing here
+can make an app left on the third tab with two files open behave like one that
+just started. Fails loudly when no hook is registered — a replay that believes
+it started from a known state and did not is a green run hiding a bug.
+
+**`expect_screenshot`** — `{"path": "tests/golden/sidebar.png"}`
+Assert that the window still looks the way it looked. The first run writes the
+golden and says so; look at it before trusting the next run. Later runs
+compare, and a failure writes this run beside the golden as `<name>.actual.png`
+so both can be opened. Matching means the same size and at most
+`pixel_tolerance` of pixels differing by more than `channel_tolerance` per
+channel — not a perceptual metric, but enough to absorb the level or two that
+text rendering moves between runs. Pin the window first; a size mismatch is
+reported as exactly that. `GPUI_MCP_UPDATE_GOLDENS=1` accepts a change instead
+of failing. Answered by the server, so the golden files live beside the script.
+
 **`gpui_guide`** — `{"topic": "recipes"}`
 This documentation. Answered by the server itself, so it works even when no
 app is running.
@@ -723,6 +751,36 @@ one the last snapshot printed on several lines, or one ending in a number the
 app generates fresh on every start (`#input-4294967299`). `a11y_audit` reports
 both about the app; the note reports them about the step you just recorded,
 while you can still target something else or go and name it.
+
+## Making it mean the same thing twice
+
+A replay has three ways to drift, and each has a fix.
+
+**The window size** decides layout, so a recorded script carries the size it
+was made at and replay applies it before the first step:
+
+```json
+{"name": "open-file", "viewport": {"width": 1280, "height": 800}, "steps": []}
+```
+
+Use `set_viewport` to pin it yourself before recording something you intend to
+keep. A window that cannot be resized aborts the replay rather than producing
+failures that all describe the wrong problem.
+
+**The starting state** only the app can define. When it has registered a hook,
+`reset_app` is a step a script can take; without one the call fails and says
+so, because a replay that believes it started from a known state and did not is
+a green run hiding a bug.
+
+**What it looks like** is `expect_screenshot`:
+
+```json
+{"method": "expect_screenshot", "params": {"path": "tests/golden/sidebar.png"}}
+```
+
+First run writes the golden and says there was nothing to compare against.
+Later runs compare, and a failure writes this run beside it as
+`<name>.actual.png`. Set `GPUI_MCP_UPDATE_GOLDENS=1` to accept a change.
 
 ## In CI, without an agent
 

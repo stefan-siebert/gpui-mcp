@@ -404,3 +404,53 @@ split in `unnamed-control`, which now tells an element with a node to add a
 label and an element without one to add a role first. The second is the
 important half: telling something with no node to "add a label" is advice that
 cannot work.
+
+## Determinism: the three ways a replay drifts
+
+A recorded script is only a test if it means the same thing tomorrow. Three
+things can change underneath it, and each is handled where it can be handled.
+
+**The window size is pinned by the script, not by the machine.** It decides
+layout — a sidebar collapses, a toolbar folds into a menu, and the element a
+step wanted is somewhere else or nowhere. So a script carries a `viewport`
+header and `replay` applies it before the first step, and the recorder asks the
+app for the size once so the header exists whether or not the session ever
+looked at a window. A resize that fails aborts the run instead of letting every
+later step fail for a reason none of them names.
+
+**The starting state is the app's to define.** Nothing on this side can make an
+app left on the third tab with two files open behave like one that just
+started, so `reset_app` calls a hook the app registers, mirroring the app-state
+provider. When no hook is registered the method *fails*. A silent no-op was the
+obvious alternative and is the worse one: a replay that believes it started
+from a known state and did not is a green run hiding a bug, and the whole point
+of the stage is not producing those.
+
+**A golden screenshot is compared in the server.** The goldens belong beside
+the script — both are artefacts of a test run, not of the application — which
+is also why the comparison is not in the app. This costs one dependency,
+`image` with PNG only. An earlier decision in this project declined `image` for
+JPEG screenshots; that was a different question with a different answer,
+because an image costs tokens by its dimensions and the encoding bought
+nothing. Comparing pixels cannot be done without decoding them.
+
+**Two numbers, and neither is called perceptual.** Images match when they are
+the same size and at most `pixel_tolerance` of pixels differ by more than
+`channel_tolerance` per channel. Text rendering, subpixel positioning and GPU
+filtering move edge pixels by a level or two between runs on the same machine;
+a comparison that called those a failure would fail every time, and a check
+that always fails is a check nobody reads. A fraction rather than a count is
+what lets one tolerance mean the same thing at every window size. The
+roadmap asked for a perceptual tolerance and this is not one — saying so is
+cheaper than pretending otherwise and being believed.
+
+**A failure leaves evidence.** The new image is written beside the golden as
+`<name>.actual.png`. A failure that reports only a percentage cannot be acted
+on; two files can be opened side by side. And a size mismatch is reported on
+its own rather than as "100% of pixels differ", because it has exactly one
+cause worth naming: the window was not pinned.
+
+**Updating goldens is an environment variable, not a parameter.** A script that
+could ask for its own golden to be rewritten would never fail. Accepting a new
+appearance is a decision a person makes for a whole run, after looking at what
+changed.

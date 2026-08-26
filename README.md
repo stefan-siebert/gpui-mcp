@@ -158,6 +158,7 @@ Windows `%APPDATA%\Claude\`):
 | `GPUI_MCP_APP` only | the newest running instance of that app |
 | neither | the newest GPUI app found; a warning on stderr when there is more than one |
 | `GPUI_MCP_RECORD` | additionally: write every successful tool call to this script file — see [Recording and replay](#recording-and-replay) |
+| `GPUI_MCP_UPDATE_GOLDENS` | `1` accepts what the window looks like now instead of failing against the stored golden — a decision for a whole run, after looking at what changed |
 
 Discovery scans the OS temp directory for `gpui-mcp-*.sock`, probes each, and
 deletes the ones nothing listens on (left behind by a crashed app).
@@ -185,6 +186,9 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `take_screenshot` | the window (or one element, cropped) rendered to PNG, downscaled to 1400px wide unless `max_width` says otherwise |
 | `get_logs` | the in-app log buffer (≤500 lines) |
 | `replay_script` | replay a recorded session — to reach a state (`seek`), or as a test |
+| `set_viewport` | resize a window to an exact content size, and answer after the frame that shows it. Recorded scripts carry a viewport and replay applies it first |
+| `reset_app` | put the app back into a known starting state via the hook it registered. Fails loudly when there is none |
+| `expect_screenshot` | compare the window against a stored golden image. Answered by the server, so the goldens live beside the script |
 
 Every input tool (`send_key`, `type_text`, `click_element`, `execute_action`)
 waits for the frame that shows what it changed, then appends the app state and
@@ -418,9 +422,64 @@ did not hold.
 
 open-file: 1 passed, 1 failed, 0 skipped, of 4
 ```
-
 Which makes the CLI form the interesting one: the file an agent produced by
 exploring runs in CI afterwards, with no agent and no model cost.
+
+### Making a replay mean the same thing twice
+
+A test that passes for the wrong reason is worse than no test, and a replay has
+three ways to drift.
+
+**The window size.** It decides layout: a sidebar collapses, a toolbar folds
+into a menu, and the element a step wanted is somewhere else or nowhere. So a
+recorded script carries the size it was made at, and replay applies it before
+the first step:
+
+```json
+{ "name": "open-file", "viewport": { "width": 1280, "height": 800 }, "steps": [] }
+```
+
+The recorder asks the app for it once, so this is filled in whether or not the
+session ever looked at a window. A window that cannot be resized aborts the
+replay rather than producing a run of failures that all describe the wrong
+problem.
+
+**The starting state.** Nothing here can make an app left on the third tab with
+two files open behave like one that just started — only the app can. Register
+what a known starting state is, the same way an app registers its state
+provider, and `reset_app` becomes a step a script can take:
+
+```rust
+gpui_component::mcp::mcp_set_reset_hook(|_arguments, cx| {
+    // put the app back where a script expects to find it
+    Ok(())
+});
+```
+
+Without a hook, `reset_app` fails and says so. That is deliberate: a replay
+which believes it started from a known state and did not is a green run hiding
+a bug.
+
+**What it looks like.** `expect_screenshot` compares the window against a
+stored image:
+
+```json
+{ "method": "expect_screenshot", "params": { "path": "tests/golden/sidebar.png" } }
+```
+
+The first run writes the golden and says there was nothing to compare against —
+look at it before trusting the next run. Later runs compare, and a failure
+writes this run beside the golden as `<name>.actual.png` so both can be opened.
+Two images match when they are the same size and at most `pixel_tolerance` of
+pixels (default 0.1%) differ by more than `channel_tolerance` per channel
+(default 8). That is not a perceptual metric and is not claimed to be — it is
+enough to absorb the level or two that text rendering moves between runs, and
+not enough to miss a layout change. A size mismatch is reported on its own,
+because it has one cause worth naming: the window was not pinned.
+
+`GPUI_MCP_UPDATE_GOLDENS=1` rewrites goldens instead of failing. It is an
+environment variable rather than a step parameter on purpose — a script that
+could update its own golden would never fail.
 
 ## Platform notes
 

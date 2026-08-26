@@ -32,7 +32,11 @@ MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJS
   `methods::*` constants. Tool names == IPC method names.
 - `src/script.rs` — recording a session to a file and replaying it, plus the
   command-line `replay` mode. Server-local: a script is a list of tool calls,
-  so nothing about it reaches the app.
+  so nothing about it reaches the app. A script's `viewport` header is applied
+  before its first step.
+- `src/golden.rs` — comparing a screenshot against a stored image, for
+  `expect_screenshot`. Server-local for the same reason: the goldens live
+  beside the script.
 - `src/docs.rs` — what the server tells an agent about itself: the
   `initialize` instructions, the `gpui_guide` tool, the guide resources and the
   `onboard` prompt, all generated from one topic table. Server-local: no IPC
@@ -81,5 +85,9 @@ cargo fmt --check                           # CI gate
 
 - `GPUI_MCP_APP` — app name passed to `init_mcp`; restricts discovery.
 - `GPUI_MCP_PID` — with `GPUI_MCP_APP`: exact socket, no discovery.
+- `GPUI_MCP_RECORD` — write every successful tool call to this script file.
+- `GPUI_MCP_UPDATE_GOLDENS` — `1` rewrites goldens instead of failing against
+  them. Deliberately not a step parameter: a script that could update its own
+  golden would never fail.
 - Sockets: `{temp_dir}/gpui-mcp-{app}-{pid}.sock`. Discovery deletes stale ones.
 - Diagnostics go to stderr; stdout is reserved for MCP JSON-RPC.

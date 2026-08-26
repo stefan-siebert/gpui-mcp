@@ -5,10 +5,10 @@ smaller payloads, and artefacts that double as tests.
 
 ## State of play
 
-Stages 0, 1, 3a and 4 are shipped and verified against a running app. Stage 2
-is done on both halves, but not the way this plan expected: the annotation
-layer 2b was going to build arrived in upstream gpui instead, so what shipped
-is a reader for it rather than a design of our own.
+Every stage is shipped and verified against a running app. Stage 2 did not land
+the way this plan expected: the annotation layer 2b was going to build arrived
+in upstream gpui instead, so what shipped is a reader for it rather than a
+design of our own.
 
 | stage | what | state |
 |---|---|---|
@@ -18,7 +18,7 @@ is a reader for it rather than a design of our own.
 | 2b | annotations: real roles, labels, values, state | done via upstream AccessKit + `a11y_tree` |
 | 2c | folding the a11y tree into the snapshot and the audit | done |
 | 3a | recording a session, replaying it, the `replay` CLI | done |
-| 3b | pinned window size, golden screenshots, an app-side reset hook | open |
+| 3b | pinned window size, golden screenshots, an app-side reset hook | done |
 | 4 | `a11y_audit`, and a failing audit failing a replay | done, minus what the derived layer cannot see |
 
 ### What happened to 2b
@@ -288,45 +288,65 @@ Shipped, in the server only — no app change and no wire change:
 - No assertion step: a `wait_for` that comes back unsatisfied is a failed
   assertion and already says which condition did not hold.
 
-Open (3b): a pinned window size, golden-screenshot comparison with a
-perceptual tolerance, and a defined starting state via an app-side reset hook.
-Recording input a *person* performs by hand would need the app side too; the
-server only sees what passes through it.
+### 3b — making a replay mean the same thing twice — **done**
 
-The original sketch below is kept for the parts not built yet.
+A test that passes for the wrong reason is worse than no test. A replay had
+three ways to drift, and each now has a fix.
+
+- **The window size.** `set_viewport` resizes to an exact content size and
+  answers after the frame that shows it; a recorded script carries a
+  `viewport` header and replay applies it before the first step. The recorder
+  asks the app for the size once, so the header is there whether or not the
+  session ever looked at a window. A window that cannot be resized aborts the
+  replay instead of producing a run of failures that all describe the wrong
+  problem. `Window::resize` was already public in the fork — no patch needed.
+- **The starting state.** `mcp_set_reset_hook` in gpui-component, mirroring
+  `mcp_set_app_state_provider`, and `reset_app` to call it. Without a hook the
+  method fails and says what to register. That is deliberate: a replay which
+  believes it started from a known state and did not is a green run hiding a
+  bug, and a silent no-op would produce exactly that.
+- **What it looks like.** `expect_screenshot`, answered by the server so the
+  goldens live beside the script. First run writes the golden and says there
+  was nothing to compare against; later runs compare and a failure writes this
+  run beside it as `<name>.actual.png`. `GPUI_MCP_UPDATE_GOLDENS=1` accepts a
+  change — an environment variable rather than a step parameter, because a
+  script that could update its own golden would never fail.
+
+**On "perceptual tolerance", which this plan asked for and did not get.** Two
+images match when they are the same size and at most `pixel_tolerance` of
+pixels (default 0.1%) differ by more than `channel_tolerance` per channel
+(default 8). That is not a perceptual metric in the CIE sense and is not
+described as one anywhere. It is enough to absorb the level or two that text
+rendering moves between runs on the same machine — a comparison that called
+those a failure would fail every time and teach everyone to ignore it — and
+not enough to miss a layout change. A size mismatch is reported on its own,
+because it has one cause worth naming.
+
+This adds one dependency to the server: `image`, PNG only, no encoders. The
+earlier decision not to take `image` for JPEG screenshots still holds and is a
+different question — that bought nothing, since an image costs tokens by its
+dimensions. Comparing pixels cannot be done without decoding them.
+
+Verified end to end: pin 1280x800, write a golden, match it at 0 differing
+pixels, resize to 1000x700 and watch the size mismatch name its own cause;
+then record at 1000x700, resize to 1400x900, replay, and watch the header put
+the window back so the golden matches again. Without the header the same
+replay fails, which is what makes the header load-bearing rather than
+decorative. The CLI exits 1 on the failing run and 0 on the passing one.
+
+Still not built, and still worth having: recording input a *person* performs by
+hand — the server only sees what passes through it, so that needs the app side.
+
+### The original sketch, for the parts still not built
 
 Record **semantically**, never as coordinates: at record time each real user
 event (hand-driven too, not just MCP-driven) is resolved against the registry
 and stored as role + name + `test_id`; anything with a keybinding is preferred
 as an `action:` step.
 
-```yaml
-name: open-file-and-search
-viewport: 1280x800          # required — layout and golden screenshots depend on it
-steps:
-  - action: elane::OpenFile
-  - wait_for: { role: dialog, name: "Open file" }
-  - type: "src/main.rs"
-  - key: enter
-  - assert: { role: tab, name: "main.rs", state: selected }
-  - audit: { fail_on: serious }
-```
-
-Two replay modes from one file: **seek** (no assertions, as fast as frames
-allow) to reach the state where work happens, and **test** (assertions plus
-optional golden-screenshot comparison with a perceptual tolerance).
-
-A CLI mode of this binary — `gpui-mcp-server run tests/*.yaml --app elane` —
-starts the app, replays and writes JUnit/TAP, so the same artefacts run in CI
-without an agent and without model cost.
-
-Cheap first version: the server can already write every forwarded tool call
-into this script format, which makes any exploratory session a draft test with
-no app changes at all.
-
-Determinism rules to build in: never `sleep`, always `wait_for`; the window
-size is fixed by the script header; a defined start state via an `app_reset`
-hook analogous to the app-state provider.
+A CLI mode that starts the app itself — `gpui-mcp-server run tests/*.json
+--app elane` — and writes JUnit/TAP, so a CI job is one command rather than a
+script that launches the app and then replays against it.
 
 ## Stage 4 — `a11y_audit` — **done, minus what cannot be seen**
 

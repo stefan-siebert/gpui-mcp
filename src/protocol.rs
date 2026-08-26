@@ -258,6 +258,10 @@ pub mod methods {
     pub const GET_APP_STATE: &str = "get_app_state";
     pub const GET_LOGS: &str = "get_logs";
 
+    // Determinism: a script that replays the same way tomorrow
+    pub const SET_VIEWPORT: &str = "set_viewport";
+    pub const RESET_APP: &str = "reset_app";
+
     /// Every method, in the order the MCP server advertises its tools.
     pub const ALL: &[&str] = &[
         GET_WINDOWS,
@@ -277,6 +281,8 @@ pub mod methods {
         TAKE_SCREENSHOT,
         GET_APP_STATE,
         GET_LOGS,
+        SET_VIEWPORT,
+        RESET_APP,
     ];
 }
 
@@ -466,6 +472,38 @@ pub struct A11yTreeParams {
 /// How many findings an audit returns unless asked for more.
 pub const DEFAULT_MAX_FINDINGS: usize = 50;
 
+/// Params for [`methods::SET_VIEWPORT`].
+///
+/// A window's size decides its layout, so a script recorded at one size and
+/// replayed at another is not replaying the same UI: a sidebar collapses, a
+/// toolbar overflows into a menu, and the element the script wanted is
+/// somewhere else or nowhere. Pinning the size is the cheapest determinism
+/// there is, which is why a recorded script carries one.
+///
+/// This is the *content* size in logical pixels, not the outer window: it is
+/// what layout sees, and what a golden screenshot is taken of.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetViewportParams {
+    pub width: f32,
+    pub height: f32,
+    /// Window to resize (default: active window).
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
+
+/// Params for [`methods::RESET_APP`].
+///
+/// Answered by a hook the app registers, the way [`methods::GET_APP_STATE`] is
+/// answered by a provider it registers. Without one the method fails and says
+/// so rather than quietly doing nothing — a replay that believes it started
+/// from a known state and did not is the kind of green run that hides a bug.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResetAppParams {
+    /// Passed to the hook unchanged. An app that has more than one starting
+    /// state can name which one it wants; most will ignore it.
+    #[serde(default)]
+    pub arguments: Option<serde_json::Value>,
+}
 /// Params for [`methods::WAIT_FOR`].
 ///
 /// Every condition that is set must hold in the same painted frame. Setting

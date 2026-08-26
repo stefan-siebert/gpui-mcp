@@ -26,7 +26,24 @@ pub struct Script {
     pub app: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_with: Option<String>,
+    /// The window size this was recorded at, in logical pixels.
+    ///
+    /// Replay applies it before the first step. A window's size decides its
+    /// layout, so a script recorded at one size and replayed at another is not
+    /// replaying the same UI — a sidebar collapses, a toolbar folds into a
+    /// menu, and the element a step wanted is somewhere else or nowhere. This
+    /// is the cheapest determinism available, and the one a golden screenshot
+    /// depends on completely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<Viewport>,
     pub steps: Vec<Step>,
+}
+
+/// A window's content size, in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Viewport {
+    pub width: f32,
+    pub height: f32,
 }
 
 /// One step: a tool name and its arguments, exactly as they were sent.
@@ -45,6 +62,7 @@ pub struct Step {
 pub const READ_ONLY: &[&str] = &[
     "a11y_audit",
     "a11y_tree",
+    "expect_screenshot",
     "get_windows",
     "get_app_state",
     "get_logs",
@@ -119,6 +137,7 @@ impl Recorder {
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION")
                 )),
+                viewport: None,
                 steps: Vec::new(),
             },
             refs: HashMap::new(),
@@ -129,6 +148,23 @@ impl Recorder {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The size this script will be replayed at, if it is known yet.
+    pub fn viewport(&self) -> Option<Viewport> {
+        self.script.viewport
+    }
+
+    /// Record the window size the session is happening at.
+    ///
+    /// Written once, from the first window seen, and never revised: a script
+    /// records the size it was *made* at. A later resize is a step in the
+    /// script, and rewriting the header to match it would quietly make the
+    /// header agree with whatever happened last.
+    pub fn note_viewport(&mut self, width: f32, height: f32) {
+        if self.script.viewport.is_none() && width >= 1.0 && height >= 1.0 {
+            self.script.viewport = Some(Viewport { width, height });
+        }
     }
 
     pub fn steps(&self) -> usize {
@@ -328,6 +364,9 @@ pub struct Report {
     pub failed: usize,
     pub skipped: usize,
     pub of: usize,
+    /// What applying [`Script::viewport`] did, when the script carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<serde_json::Value>,
     pub steps: Vec<StepOutcome>,
 }
 
@@ -344,6 +383,31 @@ pub fn replay(
 ) -> Report {
     let mut steps = Vec::with_capacity(script.steps.len());
     let (mut passed, mut failed, mut skipped) = (0, 0, 0);
+
+    // Before anything else, because everything after it depends on the
+    // layout: a script recorded at one size and replayed at another is not
+    // replaying the same UI. A window that cannot be resized aborts the run
+    // rather than producing failures that all say the wrong thing.
+    let mut viewport = None;
+    if let Some(size) = script.viewport {
+        match call(
+            "set_viewport",
+            serde_json::json!({ "width": size.width, "height": size.height }),
+        ) {
+            Ok(value) => viewport = Some(value),
+            Err(error) => {
+                return Report {
+                    ok: false,
+                    passed: 0,
+                    failed: 1,
+                    skipped: script.steps.len(),
+                    of: script.steps.len(),
+                    viewport: Some(serde_json::json!({ "error": error.to_string() })),
+                    steps: Vec::new(),
+                };
+            }
+        }
+    }
 
     for (index, step) in script.steps.iter().enumerate() {
         if options.seek && is_read_only(&step.method) {
@@ -396,6 +460,7 @@ pub fn replay(
         failed,
         skipped,
         of: script.steps.len(),
+        viewport,
         steps,
     }
 }
@@ -413,6 +478,15 @@ fn unmet_expectation(method: &str, value: &serde_json::Value) -> Option<String> 
             value.get("ran").unwrap_or(&serde_json::json!(0)),
             value.get("of").unwrap_or(&serde_json::json!(0))
         )),
+        // A golden screenshot is the same kind of assertion, about how the
+        // window looks rather than what it contains.
+        "expect_screenshot" if value.get("matched") == Some(&serde_json::json!(false)) => Some(
+            value
+                .get("detail")
+                .and_then(|detail| detail.as_str())
+                .unwrap_or("the window does not match its golden image")
+                .to_string(),
+        ),
         // An audit step in a script is an assertion about the UI, the same way
         // a wait is an assertion about its state.
         "a11y_audit" if value.get("ok") == Some(&serde_json::json!(false)) => Some(format!(
@@ -562,6 +636,7 @@ mod tests {
             name: "test".into(),
             app: None,
             recorded_with: None,
+            viewport: None,
             steps: steps
                 .iter()
                 .map(|(method, params)| Step {
@@ -802,5 +877,103 @@ mod tests {
         assert!(note.contains("generates fresh"), "{note}");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The size a window is at decides its layout, so it has to be set before
+    /// the first step rather than somewhere among them.
+    #[test]
+    fn a_viewport_is_applied_before_the_first_step() {
+        let mut script = script_of(&[("click_element", json!({ "element_id": "save" }))]);
+        script.viewport = Some(Viewport {
+            width: 1280.0,
+            height: 800.0,
+        });
+
+        let mut called = Vec::new();
+        let report = replay(&script, &ReplayOptions::default(), |method, params| {
+            called.push((method.to_string(), params));
+            Ok(json!({ "success": true, "honoured": true }))
+        });
+
+        assert!(report.ok);
+        assert_eq!(called[0].0, "set_viewport");
+        assert_eq!(called[0].1["width"], 1280.0);
+        assert_eq!(called[1].0, "click_element");
+        assert!(report.viewport.is_some(), "the report says what it did");
+    }
+
+    /// Every later step would be acting on the wrong layout, so its failures
+    /// would all describe the wrong problem.
+    #[test]
+    fn a_window_that_cannot_be_resized_stops_the_replay() {
+        let mut script = script_of(&[("click_element", json!({ "element_id": "save" }))]);
+        script.viewport = Some(Viewport {
+            width: 1280.0,
+            height: 800.0,
+        });
+
+        let mut called = Vec::new();
+        let report = replay(&script, &ReplayOptions::default(), |method, _| {
+            called.push(method.to_string());
+            Err(anyhow::anyhow!("Window not found"))
+        });
+
+        assert!(!report.ok);
+        assert_eq!(called, ["set_viewport"], "nothing else ran");
+        assert_eq!(report.skipped, 1);
+    }
+
+    /// A script with no viewport is the older shape, and still replays.
+    #[test]
+    fn a_script_without_a_viewport_just_runs() {
+        let script = script_of(&[("send_key", json!({ "key": "enter" }))]);
+
+        let mut called = Vec::new();
+        let report = replay(&script, &ReplayOptions::default(), |method, _| {
+            called.push(method.to_string());
+            Ok(json!({ "success": true }))
+        });
+
+        assert!(report.ok);
+        assert_eq!(called, ["send_key"]);
+        assert!(report.viewport.is_none());
+    }
+
+    /// A golden that no longer matches is an assertion that failed, and the
+    /// replay has to say so with the detail the comparison produced.
+    #[test]
+    fn a_mismatched_golden_fails_the_replay() {
+        let script = script_of(&[(
+            "expect_screenshot",
+            json!({ "path": "tests/golden/sidebar.png" }),
+        )]);
+
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Ok(json!({
+                "matched": false,
+                "detail": "42 of 1000 pixels differ; wrote sidebar.actual.png",
+            }))
+        });
+
+        assert!(!report.ok);
+        let detail = report.steps[0].detail.as_deref().unwrap();
+        assert!(detail.contains("actual.png"), "{detail}");
+    }
+
+    /// The first run of a golden has nothing to compare against and passes.
+    #[test]
+    fn a_freshly_written_golden_passes() {
+        let script = script_of(&[("expect_screenshot", json!({ "path": "g.png" }))]);
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Ok(json!({ "matched": true, "created": true }))
+        });
+        assert!(report.ok);
+    }
+
+    /// Seeking is about arriving. A golden is an assertion about the way
+    /// there, which is exactly what seeking skips.
+    #[test]
+    fn seeking_does_not_compare_goldens() {
+        assert!(is_read_only("expect_screenshot"));
     }
 }

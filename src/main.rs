@@ -12,6 +12,7 @@ use uds_windows::UnixStream;
 use gpui_mcp_protocol::protocol::*;
 
 mod docs;
+mod golden;
 mod script;
 
 use script::{Recorder, ReplayOptions, Script};
@@ -280,6 +281,11 @@ impl GpuiMcpServer {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<(serde_json::Value, Vec<InlineImage>)> {
+        // Server-local, and reachable here so a replay step can be one: the
+        // replay forwards every step through this function.
+        if tool_name == GOLDEN_TOOL {
+            return Ok((golden_result(self, &arguments)?, Vec::new()));
+        }
         if !methods::ALL.contains(&tool_name) {
             anyhow::bail!("Unknown tool: {}", tool_name);
         }
@@ -417,6 +423,76 @@ fn replay_result(
     Ok(result)
 }
 
+/// The content size of the window a recording is happening against.
+///
+/// `None` for every reason that is not worth interrupting a session over: no
+/// app reachable, no window open, an answer in a shape this does not
+/// recognise. A script without a viewport still replays; it just replays at
+/// whatever size the window happens to be.
+fn active_window_size(server: &GpuiMcpServer) -> Option<(f32, f32)> {
+    let windows = server
+        .send_ipc_request(methods::GET_WINDOWS, json!({}))
+        .ok()?;
+    let windows = windows.as_array()?;
+
+    let window = windows
+        .iter()
+        .find(|window| window["is_active"] == json!(true))
+        .or_else(|| windows.first())?;
+
+    let bounds = window.get("bounds")?;
+    Some((
+        bounds.get("width")?.as_f64()? as f32,
+        bounds.get("height")?.as_f64()? as f32,
+    ))
+}
+/// Name of the tool that compares the window against a stored image.
+/// Server-local, like the guide and the replay: the golden files live beside
+/// the script, not inside the app.
+const GOLDEN_TOOL: &str = "expect_screenshot";
+
+/// Take a screenshot and compare it against a golden image.
+///
+/// Full size, never downscaled: the golden is a record of what the window
+/// looked like, and a scaled copy would compare the scaler as much as the UI.
+/// The image itself is not attached to the answer — the point of the tool is
+/// a verdict and, when it fails, two file paths worth opening. Sending the
+/// picture on every check would cost image tokens to say "unchanged".
+fn golden_result(
+    server: &GpuiMcpServer,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let expectation: golden::GoldenExpectation = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow::anyhow!("{GOLDEN_TOOL}: {e}"))?;
+    if expectation.path.trim().is_empty() {
+        anyhow::bail!("{GOLDEN_TOOL} needs a `path` to the golden image");
+    }
+
+    let mut shot_params = json!({ "max_width": 0 });
+    if let Some(element_id) = &expectation.element_id {
+        shot_params["element_id"] = json!(element_id);
+    }
+    if let Some(window_id) = &expectation.window_id {
+        shot_params["window_id"] = json!(window_id);
+    }
+
+    let shot = server.send_ipc_request(methods::TAKE_SCREENSHOT, shot_params)?;
+    let shot: ScreenshotResult = serde_json::from_value(shot)
+        .map_err(|e| anyhow::anyhow!("{GOLDEN_TOOL}: the screenshot answer: {e}"))?;
+
+    let bytes = std::fs::read(&shot.path)
+        .map_err(|e| anyhow::anyhow!("Cannot read the new screenshot {}: {e}", shot.path))?;
+    // The file is a temp handoff from the app; it is ours to delete.
+    let _ = std::fs::remove_file(&shot.path);
+
+    let comparison = golden::compare(&expectation, &bytes)?;
+    let mut result = serde_json::to_value(&comparison)?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("width".into(), json!(shot.width));
+        object.insert("height".into(), json!(shot.height));
+    }
+    Ok(result)
+}
 /// A successful JSON-RPC result.
 fn ok_response(id: serde_json::Value, result: serde_json::Value) -> McpResponse {
     McpResponse {
@@ -993,6 +1069,71 @@ fn tools_list() -> serde_json::Value {
                     "properties": {},
                     "required": []
                 }
+            },
+            {
+                "name": "set_viewport",
+                "description": "Resize a window to an exact content size in logical pixels, and answer after the frame that shows it. A window's size decides its layout — a sidebar collapses, a toolbar overflows into a menu — so a script recorded at one size and replayed at another is not replaying the same UI. Recorded scripts carry a viewport and replay applies it before the first step. The answer reports the size actually reached and whether the request was honoured: a platform may impose a minimum, or refuse while maximised. Example: {\"width\": 1280, \"height\": 800}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "width": {
+                            "type": "number",
+                            "description": "Content width in logical pixels"
+                        },
+                        "height": {
+                            "type": "number",
+                            "description": "Content height in logical pixels"
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to resize (default: active window)"
+                        }
+                    },
+                    "required": ["width", "height"]
+                }
+            },
+            {
+                "name": "reset_app",
+                "description": "Put the app back into a known starting state by calling the reset hook it registered (gpui_component::mcp::mcp_set_reset_hook). This is the half of determinism only the app can supply: pinning the window size makes layout reproducible, but nothing here can make an app left on the third tab with two files open behave like one that just started. Fails, loudly, when the app registered no hook — a replay that believes it started from a known state and did not is a green run hiding a bug. Example: {}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "arguments": {
+                            "description": "Passed to the hook unchanged, for an app with more than one starting state"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "expect_screenshot",
+                "description": "Assert that the window still looks the way it looked: takes a full-size screenshot and compares it against a stored golden image. The first run writes the golden and says so — there was nothing to compare against, so look at it before trusting the next run. Later runs compare, and a failure writes the new image beside the golden as <name>.actual.png so both can be opened. Matching means: same size, and at most pixel_tolerance of pixels differing by more than channel_tolerance per channel — not a perceptual metric, but enough to absorb the level or two that text rendering moves between runs. Pin the window with set_viewport first; a different size is reported as exactly that. Re-run with GPUI_MCP_UPDATE_GOLDENS=1 to accept a change. Example: {\"path\": \"tests/golden/sidebar.png\"}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The golden image. Written on the first run, compared afterwards."
+                        },
+                        "element_id": {
+                            "type": "string",
+                            "description": "Compare only this element, cropped as take_screenshot would. Takes an id or a @ref."
+                        },
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to compare (default: active window)"
+                        },
+                        "channel_tolerance": {
+                            "type": "integer",
+                            "description": "How far one channel may move before a pixel counts as different at all. Default 8."
+                        },
+                        "pixel_tolerance": {
+                            "type": "number",
+                            "description": "Fraction of pixels allowed to differ, 0..1. Default 0.001."
+                        }
+                    },
+                    "required": ["path"]
+                }
             }
         ]
     })
@@ -1265,6 +1406,17 @@ fn main() -> Result<()> {
                         // Only successful calls are worth recording: a script
                         // of things that did not work replays nothing.
                         if let Some(recorder) = recorder.as_mut() {
+                            // A script records the size it was made at, and
+                            // the session may never call get_windows on its
+                            // own. One extra round trip, once, costs about a
+                            // millisecond and is what makes the replay
+                            // reproduce the layout rather than approximate it.
+                            if recorder.viewport().is_none() {
+                                if let Some((width, height)) = active_window_size(&server) {
+                                    recorder.note_viewport(width, height);
+                                }
+                            }
+
                             let snapshot =
                                 (tool_name == methods::UI_SNAPSHOT).then_some(text.as_str());
                             if let Err(error) =
@@ -1406,13 +1558,15 @@ mod tests {
         assert_eq!(tools[0]["name"], docs::TOOL_NAME);
         assert_eq!(
             tools.len(),
-            methods::ALL.len() + 2,
-            "every IPC method plus the two the server answers itself"
+            methods::ALL.len() + 3,
+            "every IPC method plus the three the server answers itself"
         );
-        assert!(
-            tools.iter().any(|tool| tool["name"] == REPLAY_TOOL),
-            "replay is not advertised"
-        );
+        for local in [REPLAY_TOOL, GOLDEN_TOOL] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == local),
+                "{local} is not advertised"
+            );
+        }
         for method in methods::ALL {
             assert!(
                 tools.iter().any(|tool| tool["name"] == *method),
@@ -1539,6 +1693,7 @@ mod tests {
     fn the_server_local_tools_are_not_ipc_methods() {
         assert!(!methods::ALL.contains(&docs::TOOL_NAME));
         assert!(!methods::ALL.contains(&REPLAY_TOOL));
+        assert!(!methods::ALL.contains(&GOLDEN_TOOL));
     }
 
     /// A replay that recorded itself would grow without end.
@@ -1546,6 +1701,10 @@ mod tests {
     fn the_server_local_tools_are_never_recorded() {
         assert!(script::NOT_RECORDED.contains(&docs::TOOL_NAME));
         assert!(script::NOT_RECORDED.contains(&REPLAY_TOOL));
+        assert!(
+            !script::NOT_RECORDED.contains(&GOLDEN_TOOL),
+            "a golden check is an assertion the session made; it belongs in the script"
+        );
     }
 
     #[test]
