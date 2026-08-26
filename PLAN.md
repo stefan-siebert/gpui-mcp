@@ -41,15 +41,30 @@ rebase. That is the call to make before 2b starts. Everything 2b would unlock �
 `checked`/`selected`/`disabled`, an input's value, roles for app-owned widgets,
 contrast, per-element focus — is blocked behind it.
 
-### Loose ends worth a look
+### Loose ends — closed
 
-- An id like `#input-4294967299` carries an entity number that changes on every
-  app start, but looks hand-written to the `test_id` heuristic. A recorded
-  script targeting it breaks tomorrow. An `unstable-id` audit check — an id
-  ending in a long digit run — would catch the class.
-- Repeated ids are the most common real finding, and `duplicate-id` reports
-  them, but nothing yet reports them *at record time*, when the script is being
-  written.
+Both were the same problem: an id that will not mean tomorrow what it means
+today.
+
+- **`unstable-id`**, a fifth audit check. `#input-4294967299` carries an entity
+  number that is fresh on every app start, and it is the one bad id the derived
+  layer cannot tell apart from a good one — lowercase, dashed, every bit as
+  deliberate-looking as `#save-button`. The line is drawn at six trailing
+  digits, so `item-3`, `row-42` and `since-2024` survive. Reported once per id
+  rather than once per element: sixty rows sharing a generated id are one
+  problem with one fix. A warning, not serious — nothing is broken for anyone
+  using the app right now; what breaks is everything written down against it.
+- **The recorder says so at record time.** It already warned when a `@ref`
+  pointed at a repeated id. It now also warns when a step *names* an id itself
+  that the last snapshot printed on several lines — the gap, since such a step
+  never went through the ref machinery — and when the id going into the file
+  ends in a generated number. The audit reports both about the app, later, if
+  anyone runs it. The note reports them about *this step*, while whoever is
+  recording it can still click something else or go and name it.
+
+The heuristic lives in `protocol.rs` (`id_looks_generated`, `GENERATED_ID_DIGITS`)
+so both halves agree on what "generated" means instead of guessing it the same
+way twice.
 
 ### Verifying a change by hand
 
@@ -239,10 +254,11 @@ hook analogous to the app-state provider.
 
 ## Stage 4 — `a11y_audit` — **done, minus what cannot be seen**
 
-Shipped: `unnamed-control`, `duplicate-id`, `target-too-small` and
-`zero-size-control`, ordered worst first, each naming the element, its id and
-gpui's source location. A failing audit fails a replay step, so accessibility
-is part of a regression run rather than a thing checked once.
+Shipped: `unnamed-control`, `duplicate-id`, `target-too-small`,
+`zero-size-control` and `unstable-id`, ordered worst first, each naming the
+element, its id and gpui's source location. A failing audit fails a replay
+step, so accessibility is part of a regression run rather than a thing checked
+once.
 
 Not shipped, because the derived layer cannot see it: contrast (no colours on
 this side), keyboard reachability and focus traps (focus is a `FocusHandle`,

@@ -522,6 +522,33 @@ pub const MAX_BATCH_STEPS: usize = 32;
 /// Deadline for a whole [`methods::BATCH`], however its steps divide it.
 pub const MAX_BATCH_MS: u64 = 45_000;
 
+/// The number of trailing digits at which an id stops looking hand-written.
+///
+/// gpui builds an element id out of what the app passed plus the numbers it
+/// generates itself, and the two end up in the same string: an entity number
+/// becomes `input-4294967299`, which is lowercase, dashed and looks every bit
+/// as deliberate as `save-button`. The difference only shows tomorrow — the
+/// number is fresh on every app start, so anything written down against it
+/// matches nothing on the next run.
+///
+/// Six is where the line goes so that a counter or a year survives: `item-3`,
+/// `row-42` and `since-2024` are ids people write; `input-4294967299` is not.
+pub const GENERATED_ID_DIGITS: usize = 6;
+
+/// Whether a `test_id` ends in a number the app generated rather than chose.
+///
+/// Both halves ask this — the audit, to report the id, and the recorder, to
+/// warn before writing it into a script — so it lives here rather than being
+/// guessed the same way twice.
+pub fn id_looks_generated(test_id: &str) -> bool {
+    test_id
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .count()
+        >= GENERATED_ID_DIGITS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +721,19 @@ mod tests {
                       "visible":true,"children":[],"properties":{}}"#;
         let el: UiElement = serde_json::from_str(json).unwrap();
         assert!(el.text_content.is_empty());
+    }
+
+    /// The whole point: `input-4294967299` is lowercase and dashed, exactly
+    /// like an id somebody chose, and only the digit run tells them apart.
+    #[test]
+    fn a_generated_id_is_told_apart_from_a_written_one() {
+        assert!(id_looks_generated("input-4294967299"));
+        assert!(id_looks_generated("view4294967734"));
+
+        assert!(!id_looks_generated("save-button"));
+        assert!(!id_looks_generated("item-3"));
+        assert!(!id_looks_generated("row-42"));
+        assert!(!id_looks_generated("since-2024"), "a year is not a handle");
+        assert!(!id_looks_generated(""));
     }
 }

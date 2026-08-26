@@ -200,9 +200,10 @@ app rather than costing the agent a call per look.
 `@ref` from the last `ui_snapshot`, the full id
 (`WindowId(1)/view-1.panel[0]`), the global id (`view-1.panel`), or a suffix
 (`panel`) — the first match wins. An id copied out of `format: "compact"`
-output works too, shortened crate paths and instance suffix and all. Give the
-elements you want to target stable ids in the app (`div().id("results")`): a
-lowercase, dashed id is what the snapshot prints as `#results`.
+output works too, shortened crate paths and instance suffix and all, as does
+the `#panel` the snapshot prints. Give the elements you want to target stable
+ids in the app (`div().id("results")`): a lowercase, dashed id is what the
+snapshot prints as `#results`.
 
 ### The snapshot
 
@@ -262,6 +263,7 @@ problems it can actually see:
 | `duplicate-id` | serious on a control, else warning | one id names several elements. A suffix match takes the first, so a click or a recorded script may act on the wrong one |
 | `target-too-small` | warning | an interactive element with a side under `min_target_size`, 24px by default (WCAG 2.2) |
 | `zero-size-control` | serious | an interactive element painted with no area at all |
+| `unstable-id` | warning | an id ending in a number the app generates fresh on every start, like `#input-4294967299`. It reads like a name and is not one: anything written down against it matches nothing after a restart |
 
 A first run against a real desktop UI — the gpui-component gallery, an
 unmodified upstream demo used here as a test subject — reported nine unnamed
@@ -325,6 +327,13 @@ file. Where there was no id, or an id like `#item` that appeared on several
 lines, the ref is kept and the step carries a `note` saying it will only replay
 if the preceding snapshot produces the same lines. The fix is in the app: give
 that element its own id.
+
+The recorder also writes a `note` when the id going into the file will not
+hold — an id the last snapshot printed on several lines, or one ending in a
+generated number (`#input-4294967299`). The audit reports both of these too,
+but it reports them about the app, later, if anyone runs it. The note reports
+them about *this step*, while the person recording it can still pick a
+different element or go and name that one.
 
 Replaying the file does two different jobs:
 

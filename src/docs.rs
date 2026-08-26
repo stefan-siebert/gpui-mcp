@@ -223,13 +223,14 @@ Start here. On a real UI this is a small fraction of the tree's size, and the
 Checks the window for problems that hurt a screen-reader user and you equally:
 a control with no text (nothing can name it, and you have nothing to match on),
 an id that names several elements (a suffix match takes the first, so a script
-targeting it may act on the wrong one), a target below 24px, a control painted
-with no area. Each finding names the element, its id, and the source location
-gpui recorded for it — which for a gpui-component widget is the widget's own
-file, so it tells you *what* the element is; the id and the element path are
-what locate it in your code. It reads the same derived layer as the snapshot,
-so it cannot see colours and does not check contrast. Options:
-`root_element_id`,
+targeting it may act on the wrong one), an id ending in a generated number
+(`#input-4294967299` looks like a name and is not one — it is different on the
+next app start), a target below 24px, a control painted with no area. Each
+finding names the element, its id, and the source location gpui recorded for it
+— which for a gpui-component widget is the widget's own file, so it tells you
+*what* the element is; the id and the element path are what locate it in your
+code. It reads the same derived layer as the snapshot, so it cannot see colours
+and does not check contrast. Options: `root_element_id`,
 `fail_on` (`serious` by default, or `warning`, or `none`), `min_target_size`,
 `max_findings`. As a step in a recorded script, a failing audit fails the
 replay.
@@ -509,7 +510,8 @@ A `@ref` is shorthand for "the thing on that line of the snapshot I just
 showed you". Each snapshot replaces the previous set, so a ref from an older
 one fails with a message telling you to take a new snapshot — it never
 silently resolves to whatever now sits on that line. An id copied out of
-`format: "compact"` output works too, instance suffix and all.
+`format: "compact"` output works too, instance suffix and all — and so does the
+`#panel` a snapshot prints, since that is the string in front of you.
 
 The id path comes from GPUI's element ids: only elements the app gave an id
 (`div().id("results")`) appear as a named segment. Anonymous layout elements
@@ -689,6 +691,12 @@ When it did not — no id, or an id like `#item` that appears on several lines �
 the ref is kept as written and the step carries a `note` saying so. Such a step
 only replays correctly if the snapshot before it produces the same lines. The
 fix is in the app: give that element its own id.
+
+A `note` is also written when the id that *did* go into the file will not hold:
+one the last snapshot printed on several lines, or one ending in a number the
+app generates fresh on every start (`#input-4294967299`). `a11y_audit` reports
+both about the app; the note reports them about the step you just recorded,
+while you can still target something else or go and name it.
 
 ## In CI, without an agent
 

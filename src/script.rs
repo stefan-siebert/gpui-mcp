@@ -94,6 +94,9 @@ pub struct Recorder {
     refs: HashMap<String, String>,
     /// `e3` -> `item`, for refs whose id appeared more than once.
     ambiguous: HashMap<String, String>,
+    /// `item` -> 62, every id in that snapshot and how many lines carried it.
+    /// This is what catches an id a step names outright rather than by ref.
+    id_counts: HashMap<String, usize>,
 }
 
 impl Recorder {
@@ -119,6 +122,7 @@ impl Recorder {
             },
             refs: HashMap::new(),
             ambiguous: HashMap::new(),
+            id_counts: HashMap::new(),
         }
     }
 
@@ -168,65 +172,105 @@ impl Recorder {
     fn learn_refs(&mut self, snapshot: &str) {
         self.refs.clear();
         self.ambiguous.clear();
+        self.id_counts.clear();
 
-        let mut seen: HashMap<&str, usize> = HashMap::new();
         let mut lines = Vec::new();
         for line in snapshot.lines() {
             let Some((reference, test_id)) = parse_snapshot_line(line) else {
                 continue;
             };
-            *seen.entry(test_id).or_insert(0) += 1;
-            lines.push((reference, test_id));
+            *self.id_counts.entry(test_id.to_string()).or_insert(0) += 1;
+            lines.push((reference.to_string(), test_id.to_string()));
         }
 
         for (reference, test_id) in lines {
-            let table = match seen.get(test_id) {
+            let table = match self.id_counts.get(&test_id) {
                 Some(1) => &mut self.refs,
                 _ => &mut self.ambiguous,
             };
-            table.insert(reference.to_string(), test_id.to_string());
+            table.insert(reference, test_id);
         }
     }
 
-    /// Replace `@e7` with the id the snapshot printed beside it.
+    /// Replace `@e7` with the id the snapshot printed beside it, and say so
+    /// when the id that ends up in the file will not hold.
     ///
     /// A ref means "line 7 of the snapshot I am looking at", which is true for
     /// exactly as long as that snapshot is the current one. Writing it into a
     /// file unchanged would record a number, not an intention.
     fn resolve_refs(&self, mut params: serde_json::Value) -> (serde_json::Value, Option<String>) {
-        let mut note = None;
+        let mut notes: Vec<String> = Vec::new();
 
         for key in ["element_id", "root_element_id"] {
             let Some(value) = params.get(key).and_then(|value| value.as_str()) else {
                 continue;
             };
-            let Some(reference) = value.strip_prefix('@') else {
-                continue;
+            let value = value.to_string();
+
+            // Either the step named a ref, which becomes an id here, or it
+            // named an id outright. Both end up as something written into the
+            // file, and both are worth the same doubts.
+            let written = match value.strip_prefix('@') {
+                None => Some(value.clone()),
+                Some(reference) => match self.refs.get(reference) {
+                    Some(test_id) => {
+                        params[key] = serde_json::json!(test_id);
+                        Some(test_id.clone())
+                    }
+                    None => {
+                        notes.push(match self.ambiguous.get(reference) {
+                            Some(test_id) => format!(
+                                "'{value}' pointed at #{test_id}, which appears on more than one \
+                                 line of that snapshot and so does not identify it. The ref was \
+                                 left as written and will only replay if the snapshot before it \
+                                 produces the same lines. Give that element its own id in the app."
+                            ),
+                            None => format!(
+                                "'{value}' is a snapshot ref with no id beside it, so it was left \
+                                 as written and will only replay if the snapshot before it \
+                                 produces the same lines. Give that element an id in the app."
+                            ),
+                        });
+                        None
+                    }
+                },
             };
 
-            match self.refs.get(reference) {
-                Some(test_id) => {
-                    params[key] = serde_json::json!(test_id);
-                }
-                None => {
-                    note = Some(match self.ambiguous.get(reference) {
-                        Some(test_id) => format!(
-                            "'{value}' pointed at #{test_id}, which appears on more than one \
-                             line of that snapshot and so does not identify it. The ref was \
-                             left as written and will only replay if the snapshot before it \
-                             produces the same lines. Give that element its own id in the app."
-                        ),
-                        None => format!(
-                            "'{value}' is a snapshot ref with no id beside it, so it was left \
-                             as written and will only replay if the snapshot before it \
-                             produces the same lines. Give that element an id in the app."
-                        ),
-                    });
-                }
+            if let Some(note) = written.as_deref().and_then(|id| self.doubts_about(id)) {
+                notes.push(note);
             }
         }
 
-        (params, note)
+        (params, (!notes.is_empty()).then(|| notes.join(" ")))
+    }
+
+    /// What is wrong with the id this step is about to be written down with.
+    ///
+    /// The audit reports both of these too, but it reports them about the app,
+    /// later, if anyone runs it. Here they are reported about *this step*, at
+    /// the moment the script is being written — which is the moment somebody
+    /// can still pick a different element to click, or go and name it.
+    fn doubts_about(&self, id: &str) -> Option<String> {
+        // A step may name an id in any of the forms the app resolves: `#save`,
+        // a bare `save`, or a whole dotted path ending in it. The snapshot
+        // counts last segments, so compare last segments.
+        let segment = id.trim_start_matches('#').rsplit('.').next()?;
+
+        if let Some(count) = self.id_counts.get(segment).filter(|count| **count > 1) {
+            return Some(format!(
+                "#{segment} names {count} elements in the snapshot before this step. A suffix \
+                 match takes the first, so this step may replay against a different one than it \
+                 was recorded against. Give that element its own id in the app."
+            ));
+        }
+
+        gpui_mcp_protocol::protocol::id_looks_generated(segment).then(|| {
+            format!(
+                "#{segment} ends in a number the app generates fresh on every start, so it reads \
+                 like a name and is not one: this step will find nothing after a restart. Give \
+                 that element an id of its own in the app."
+            )
+        })
     }
 }
 
@@ -693,5 +737,69 @@ mod tests {
 
         assert!(!report.ok);
         assert!(report.steps[0].detail.as_deref().unwrap().contains("nope"));
+    }
+
+    /// The gap the ref machinery left open: a step that names `#item` itself
+    /// never went through a ref, so nothing looked at how many `#item`s there
+    /// are. Record time is when that is still cheap to fix.
+    #[test]
+    fn an_id_a_step_names_itself_is_checked_too() {
+        let path = temp_path("literal-ambiguous");
+        let mut recorder = Recorder::new(&path, None);
+
+        recorder
+            .record(
+                "ui_snapshot",
+                &json!({}),
+                Some(
+                    "- listitem \"One\" #item @e1\n\
+                     - listitem \"Two\" #item @e2\n\
+                     - button \"Save\" #save @e3\n",
+                ),
+            )
+            .unwrap();
+        recorder
+            .record("click_element", &json!({ "element_id": "#item" }), None)
+            .unwrap();
+        recorder
+            .record("wait_for", &json!({ "element_id": "save" }), None)
+            .unwrap();
+
+        let written = Script::read(&path).unwrap();
+        let note = written.steps[1].note.as_deref().expect("a warning");
+        assert!(note.contains("#item names 2"), "{note}");
+        assert!(written.steps[2].note.is_none(), "the unique one is fine");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `#input-4294967299` passes every test for a hand-written id and is not
+    /// one. Nothing else in the recorder can tell the difference, so the note
+    /// is the only thing standing between it and a script that breaks on the
+    /// next app start.
+    #[test]
+    fn an_id_carrying_an_entity_number_is_recorded_with_a_warning() {
+        let path = temp_path("generated-id");
+        let mut recorder = Recorder::new(&path, None);
+
+        recorder
+            .record(
+                "ui_snapshot",
+                &json!({}),
+                Some("- textbox #input-4294967299 @e1\n"),
+            )
+            .unwrap();
+        recorder
+            .record("click_element", &json!({ "element_id": "@e1" }), None)
+            .unwrap();
+
+        let written = Script::read(&path).unwrap();
+        // Still rewritten: the id at least says which element was meant, and
+        // the ref says only which line it was on.
+        assert_eq!(written.steps[1].params["element_id"], "input-4294967299");
+        let note = written.steps[1].note.as_deref().expect("a warning");
+        assert!(note.contains("generates fresh"), "{note}");
+
+        std::fs::remove_file(&path).ok();
     }
 }
