@@ -19,11 +19,18 @@
 //!   to differ. A blinking cursor is a handful of pixels; a changed layout is
 //!   not.
 //!
-//! A size mismatch is reported on its own, because it has one cause worth
-//! naming: the window was not the size the script pinned.
+//! A size mismatch is reported on its own, because nothing was compared and
+//! the causes are few enough to name: the window was not the size the script
+//! pinned, or the display has a different scale factor than the one the
+//! golden was taken on — a golden is in device pixels.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Name of the tool that compares the window against a stored image.
+/// Server-local, like the guide and the replay: the golden files live beside
+/// the script, not inside the app.
+pub const TOOL_NAME: &str = "expect_screenshot";
 
 /// How far a single channel may move before a pixel counts as different.
 pub const DEFAULT_CHANNEL_TOLERANCE: u8 = 8;
@@ -32,20 +39,28 @@ pub const DEFAULT_CHANNEL_TOLERANCE: u8 = 8;
 pub const DEFAULT_PIXEL_TOLERANCE: f64 = 0.001;
 
 /// Params for the server-local `expect_screenshot` tool.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Only ever read: a recorder stores a step's arguments as the JSON they
+/// arrived as, so nothing serialises this.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct GoldenExpectation {
     /// The golden file. Written on the first run, compared afterwards.
+    ///
+    /// Relative to the working directory when called as a tool. In a script it
+    /// is relative to the script file — the recorder writes it that way and
+    /// replay resolves it that way — so "the goldens live beside the script"
+    /// stays true from whichever directory the replay is started.
     pub path: String,
     /// Compare only this element, as `take_screenshot` would crop it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub element_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub window_id: Option<String>,
     /// See the module docs. Default [`DEFAULT_CHANNEL_TOLERANCE`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub channel_tolerance: Option<u8>,
     /// See the module docs. Default [`DEFAULT_PIXEL_TOLERANCE`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub pixel_tolerance: Option<f64>,
 }
 
@@ -53,6 +68,11 @@ pub struct GoldenExpectation {
 #[derive(Debug, Clone, Serialize)]
 pub struct Comparison {
     pub matched: bool,
+    /// True when pixels were actually compared. False when the golden was
+    /// written or rewritten instead, and false on a size mismatch: the
+    /// differing counts are zero then because nothing was looked at, not
+    /// because nothing differed.
+    pub compared: bool,
     /// True when the golden did not exist and has just been written. The step
     /// passes — there was nothing to compare against — and says so, because a
     /// run that silently creates its own expectations proves nothing.
@@ -60,6 +80,9 @@ pub struct Comparison {
     pub golden: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual: Option<String>,
+    /// The size of this run's image, in device pixels.
+    pub width: u32,
+    pub height: u32,
     pub differing_pixels: u64,
     pub total_pixels: u64,
     pub differing_fraction: f64,
@@ -77,12 +100,31 @@ pub struct Comparison {
 /// could update its own golden would never fail.
 pub fn updating_goldens() -> bool {
     std::env::var("GPUI_MCP_UPDATE_GOLDENS")
-        .map(|value| !value.trim().is_empty() && value.trim() != "0")
+        .map(|value| switch_is_on(&value))
         .unwrap_or(false)
 }
 
+/// `1` and its spellings mean on. Everything else means off — including
+/// `false`, which a CI file exporting a YAML boolean produces as a string. The
+/// one switch that makes every golden pass must not be turned on by a value
+/// that says no.
+fn switch_is_on(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Compare freshly taken PNG bytes against the golden at `path`.
-pub fn compare(expectation: &GoldenExpectation, actual_png: &[u8]) -> anyhow::Result<Comparison> {
+///
+/// `scale_factor` is the device scale the screenshot was rendered at, when
+/// the app reported one; it only matters for naming the cause of a size
+/// mismatch.
+pub fn compare(
+    expectation: &GoldenExpectation,
+    actual_png: &[u8],
+    scale_factor: Option<f32>,
+) -> anyhow::Result<Comparison> {
     let golden_path = PathBuf::from(&expectation.path);
     let channel_tolerance = expectation
         .channel_tolerance
@@ -92,11 +134,15 @@ pub fn compare(expectation: &GoldenExpectation, actual_png: &[u8]) -> anyhow::Re
         .unwrap_or(DEFAULT_PIXEL_TOLERANCE)
         .clamp(0.0, 1.0);
 
-    let actual = decode(actual_png).map_err(|e| anyhow::anyhow!("the new screenshot: {e}"))?;
-    let total_pixels = u64::from(actual.width()) * u64::from(actual.height());
+    // The header is enough to know the size, and to know these bytes are a
+    // PNG before they are stored as one. Decoding the pixels waits until
+    // there is a golden to compare them with.
+    let (width, height) =
+        png_dimensions(actual_png).map_err(|e| anyhow::anyhow!("the new screenshot: {e}"))?;
+    let total_pixels = u64::from(width) * u64::from(height);
 
-    if !golden_path.exists() || updating_goldens() {
-        let created = !golden_path.exists();
+    let created = !golden_path.exists();
+    if created || updating_goldens() {
         write_png(&golden_path, actual_png)?;
         let detail = if created {
             format!(
@@ -113,9 +159,12 @@ pub fn compare(expectation: &GoldenExpectation, actual_png: &[u8]) -> anyhow::Re
 
         return Ok(Comparison {
             matched: true,
+            compared: false,
             created,
             golden: golden_path.display().to_string(),
             actual: None,
+            width,
+            height,
             differing_pixels: 0,
             total_pixels,
             differing_fraction: 0.0,
@@ -130,32 +179,33 @@ pub fn compare(expectation: &GoldenExpectation, actual_png: &[u8]) -> anyhow::Re
     let golden =
         decode(&golden_bytes).map_err(|e| anyhow::anyhow!("{}: {e}", golden_path.display()))?;
 
-    if golden.dimensions() != actual.dimensions() {
+    if golden.dimensions() != (width, height) {
         let actual_path = write_actual(&golden_path, actual_png)?;
-        let detail = format!(
-            "The golden is {}x{} and this run is {}x{}. Nothing was compared: a different size \
-             is a different layout. This is what an unpinned window looks like — give the \
-             script a viewport, or call set_viewport before the first step.",
-            golden.width(),
-            golden.height(),
-            actual.width(),
-            actual.height()
+        let detail = size_mismatch_detail(
+            golden.dimensions(),
+            (width, height),
+            scale_factor,
+            expectation.element_id.is_some(),
         );
 
         return Ok(Comparison {
             matched: false,
+            compared: false,
             created: false,
             golden: golden_path.display().to_string(),
             actual: Some(actual_path),
-            differing_pixels: total_pixels,
+            width,
+            height,
+            differing_pixels: 0,
             total_pixels,
-            differing_fraction: 1.0,
+            differing_fraction: 0.0,
             pixel_tolerance,
             channel_tolerance,
             detail: Some(detail),
         });
     }
 
+    let actual = decode(actual_png).map_err(|e| anyhow::anyhow!("the new screenshot: {e}"))?;
     let differing = differing_pixels(&golden, &actual, channel_tolerance);
     let fraction = if total_pixels == 0 {
         0.0
@@ -182,9 +232,12 @@ pub fn compare(expectation: &GoldenExpectation, actual_png: &[u8]) -> anyhow::Re
 
     Ok(Comparison {
         matched,
+        compared: true,
         created: false,
         golden: golden_path.display().to_string(),
         actual: actual_path,
+        width,
+        height,
         differing_pixels: differing,
         total_pixels,
         differing_fraction: fraction,
@@ -194,9 +247,68 @@ pub fn compare(expectation: &GoldenExpectation, actual_png: &[u8]) -> anyhow::Re
     })
 }
 
+/// Name what a size mismatch can mean, in the order worth checking.
+///
+/// The image is in device pixels and a viewport in logical ones, so the same
+/// pinned window on a display with a different scale factor is a different
+/// image — and that case is recognisable, because both sides grow by the same
+/// factor. A window that was not pinned is the other cause, and a cropped
+/// element that changed its own size the third.
+fn size_mismatch_detail(
+    golden: (u32, u32),
+    actual: (u32, u32),
+    scale_factor: Option<f32>,
+    cropped: bool,
+) -> String {
+    let mut detail = format!(
+        "The golden is {}x{} and this run is {}x{}{}. Nothing was compared: a different size is \
+         a different layout.",
+        golden.0,
+        golden.1,
+        actual.0,
+        actual.1,
+        scale_factor
+            .map(|scale| format!(" at a device scale of {scale}"))
+            .unwrap_or_default()
+    );
+
+    let ratio_x = f64::from(actual.0) / f64::from(golden.0.max(1));
+    let ratio_y = f64::from(actual.1) / f64::from(golden.1.max(1));
+    let same_factor = (ratio_x - ratio_y).abs() < 0.01 && (ratio_x - 1.0).abs() > 0.01;
+
+    if same_factor {
+        detail.push_str(&format!(
+            " Both sides differ by the same factor ({ratio_x:.2}), which is what a different \
+             display scale looks like: a golden is in device pixels, so it only matches on a \
+             display with the scale factor it was taken at. If the display is the same, the \
+             window was not pinned — give the script a viewport, or call set_viewport before \
+             the first step."
+        ));
+    } else if cropped {
+        detail.push_str(
+            " With element_id set, either the element itself changed size, or the window was \
+             not pinned — give the script a viewport, or call set_viewport before the first \
+             step.",
+        );
+    } else {
+        detail.push_str(
+            " This is what an unpinned window looks like — give the script a viewport, or call \
+             set_viewport before the first step.",
+        );
+    }
+    detail
+}
+
+/// The size a PNG declares, read from its header alone.
+fn png_dimensions(bytes: &[u8]) -> anyhow::Result<(u32, u32)> {
+    let reader =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+    Ok(reader.into_dimensions()?)
+}
+
 fn decode(bytes: &[u8]) -> anyhow::Result<image::RgbaImage> {
     let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?;
-    Ok(decoded.to_rgba8())
+    Ok(decoded.into_rgba8())
 }
 
 /// Count the pixels that moved further than the tolerance on any channel.
@@ -217,24 +329,25 @@ fn differing_pixels(golden: &image::RgbaImage, actual: &image::RgbaImage, tolera
 }
 
 fn write_png(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+    crate::script::ensure_parent_dir(path)?;
     std::fs::write(path, bytes)
         .map_err(|e| anyhow::anyhow!("Cannot write {}: {e}", path.display()))?;
     Ok(())
 }
 
-/// Put the failing image beside the golden, as `<name>.actual.png`.
+/// Where a failing image goes: beside the golden, as `<name>.actual.png`.
+pub fn actual_path(golden: &Path) -> PathBuf {
+    let mut name = golden.file_stem().unwrap_or_default().to_os_string();
+    name.push(".actual.png");
+    golden.with_file_name(name)
+}
+
+/// Put the failing image beside the golden.
 ///
 /// A failure that only reports a percentage cannot be acted on. The two files
 /// side by side can be opened, diffed, or dropped into a review.
 fn write_actual(golden: &Path, bytes: &[u8]) -> anyhow::Result<String> {
-    let mut name = golden.file_stem().unwrap_or_default().to_os_string();
-    name.push(".actual.png");
-    let path = golden.with_file_name(name);
+    let path = actual_path(golden);
     write_png(&path, bytes)?;
     Ok(path.display().to_string())
 }
@@ -276,9 +389,7 @@ mod tests {
 
     fn clean(path: &Path) {
         std::fs::remove_file(path).ok();
-        let mut name = path.file_stem().unwrap_or_default().to_os_string();
-        name.push(".actual.png");
-        std::fs::remove_file(path.with_file_name(name)).ok();
+        std::fs::remove_file(actual_path(path)).ok();
     }
 
     /// The first run has nothing to compare against. It must say so rather
@@ -289,18 +400,34 @@ mod tests {
         let path = temp("first");
         clean(&path);
 
-        let result = compare(&expectation(&path), &png(4, 4, [10, 20, 30, 255])).unwrap();
+        let bytes = png(4, 4, [10, 20, 30, 255]);
+        let result = compare(&expectation(&path), &bytes, None).unwrap();
 
         assert!(result.matched);
         assert!(result.created);
+        assert!(!result.compared);
+        assert_eq!((result.width, result.height), (4, 4));
         assert!(result
             .detail
             .as_deref()
             .unwrap()
             .contains("nothing to compare"));
-        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "stored byte for byte");
 
         clean(&path);
+    }
+
+    /// Whatever the app hands over is stored as the golden, so it had better
+    /// be an image — a run that stored garbage would fail every later run
+    /// with a message about the golden, not about the screenshot.
+    #[test]
+    fn bytes_that_are_not_a_png_are_refused_before_being_stored() {
+        let path = temp("garbage");
+        clean(&path);
+
+        let error = compare(&expectation(&path), b"not a png", None).expect_err("refused");
+        assert!(error.to_string().contains("new screenshot"), "{error}");
+        assert!(!path.exists(), "nothing was written");
     }
 
     /// Edge pixels move by a level or two between runs on the same machine.
@@ -311,9 +438,10 @@ mod tests {
         let path = temp("shift");
         std::fs::write(&path, png(4, 4, [100, 100, 100, 255])).unwrap();
 
-        let result = compare(&expectation(&path), &png(4, 4, [104, 96, 100, 255])).unwrap();
+        let result = compare(&expectation(&path), &png(4, 4, [104, 96, 100, 255]), None).unwrap();
 
         assert!(result.matched, "{:?}", result.detail);
+        assert!(result.compared);
         assert_eq!(result.differing_pixels, 0);
 
         clean(&path);
@@ -324,7 +452,7 @@ mod tests {
         let path = temp("differs");
         std::fs::write(&path, png(4, 4, [0, 0, 0, 255])).unwrap();
 
-        let result = compare(&expectation(&path), &png(4, 4, [255, 255, 255, 255])).unwrap();
+        let result = compare(&expectation(&path), &png(4, 4, [255, 255, 255, 255]), None).unwrap();
 
         assert!(!result.matched);
         assert_eq!(result.differing_pixels, 16);
@@ -349,7 +477,7 @@ mod tests {
         changed.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
         let bytes = encode(&changed);
 
-        let strict = compare(&expectation(&path), &bytes).unwrap();
+        let strict = compare(&expectation(&path), &bytes, None).unwrap();
         assert!(!strict.matched, "one pixel of sixteen is over the default");
         assert_eq!(strict.differing_pixels, 1);
 
@@ -359,6 +487,7 @@ mod tests {
                 ..expectation(&path)
             },
             &bytes,
+            None,
         )
         .unwrap();
         assert!(lenient.matched, "{:?}", lenient.detail);
@@ -366,21 +495,86 @@ mod tests {
         clean(&path);
     }
 
-    /// A different size has one cause worth naming, and comparing pixels
-    /// across it would be meaningless anyway.
+    /// A different size is reported as exactly that, with nothing counted as
+    /// differing — "100% of pixels differ" would be a claim about a comparison
+    /// that never happened.
     #[test]
     fn a_different_size_says_the_window_was_not_pinned() {
         let path = temp("size");
         std::fs::write(&path, png(4, 4, [0, 0, 0, 255])).unwrap();
 
-        let result = compare(&expectation(&path), &png(8, 4, [0, 0, 0, 255])).unwrap();
+        let result = compare(&expectation(&path), &png(8, 4, [0, 0, 0, 255]), None).unwrap();
 
         assert!(!result.matched);
+        assert!(!result.compared);
+        assert_eq!(result.differing_pixels, 0);
+        assert_eq!(result.differing_fraction, 0.0);
         let detail = result.detail.as_deref().unwrap();
         assert!(detail.contains("4x4"), "{detail}");
         assert!(detail.contains("8x4"), "{detail}");
         assert!(detail.contains("viewport"), "{detail}");
+        assert!(!detail.contains("display scale"), "{detail}");
 
         clean(&path);
+    }
+
+    /// The same window on a 200% display is twice the image. Telling that
+    /// user to pin the window would send them looking in the wrong place.
+    #[test]
+    fn a_uniformly_scaled_size_names_the_display_scale() {
+        let path = temp("scale");
+        std::fs::write(&path, png(4, 4, [0, 0, 0, 255])).unwrap();
+
+        let result = compare(&expectation(&path), &png(8, 8, [0, 0, 0, 255]), Some(2.0)).unwrap();
+
+        assert!(!result.matched);
+        let detail = result.detail.as_deref().unwrap();
+        assert!(detail.contains("2.00"), "{detail}");
+        assert!(detail.contains("display scale"), "{detail}");
+        assert!(detail.contains("device scale of 2"), "{detail}");
+
+        clean(&path);
+    }
+
+    /// A cropped element has a third way to change size: itself.
+    #[test]
+    fn a_cropped_mismatch_mentions_the_element() {
+        let path = temp("cropped");
+        std::fs::write(&path, png(4, 4, [0, 0, 0, 255])).unwrap();
+
+        let result = compare(
+            &GoldenExpectation {
+                element_id: Some("sidebar".into()),
+                ..expectation(&path)
+            },
+            &png(6, 4, [0, 0, 0, 255]),
+            None,
+        )
+        .unwrap();
+
+        let detail = result.detail.as_deref().unwrap();
+        assert!(detail.contains("element itself"), "{detail}");
+
+        clean(&path);
+    }
+
+    /// `GPUI_MCP_UPDATE_GOLDENS=false` in a CI file must not switch on the one
+    /// thing that makes every golden pass.
+    #[test]
+    fn only_a_yes_turns_updating_on() {
+        for on in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(switch_is_on(on), "{on:?}");
+        }
+        for off in ["", "0", "false", "False", "no", "off", "2", "update"] {
+            assert!(!switch_is_on(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn the_actual_image_sits_beside_the_golden() {
+        assert_eq!(
+            actual_path(Path::new("tests/golden/sidebar.png")),
+            Path::new("tests/golden/sidebar.actual.png")
+        );
     }
 }

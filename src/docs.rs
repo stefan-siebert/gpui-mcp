@@ -204,8 +204,10 @@ defaults to the active window.
 ## Inspection
 
 **`get_windows`** — `{}`
-Returns `[{id, title, bounds:{x,y,width,height}, is_active}]`. The `id` looks
-like `"WindowId(1)"` and is what every other tool's `window_id` wants.
+Returns `[{id, title, bounds:{x,y,width,height}, content_size:{width,height},
+is_active}]`. The `id` looks like `"WindowId(1)"` and is what every other
+tool's `window_id` wants. `bounds` is the outer frame (on macOS including the
+title bar); `content_size` is what layout sees and what `set_viewport` sets.
 
 **`ui_snapshot`** — `{}` or `{"interactive_only": true}`
 The window as a short list: one line per element that means something, layout
@@ -351,7 +353,9 @@ into a menu — so a script recorded at one size and replayed at another is not
 replaying the same UI. Recorded scripts carry a `viewport` and replay applies
 it before the first step. The answer says what size was actually reached and
 whether the request was `honoured`: a platform may impose a minimum, or refuse
-while maximised.
+while maximised. In a replay, `honoured: false` fails the step — and stops the
+run when it is the header — because every later step would be acting on a
+layout the script never meant.
 
 **`reset_app`** — `{}`
 Put the app back into a known starting state, by calling the hook it
@@ -369,8 +373,13 @@ so both can be opened. Matching means the same size and at most
 `pixel_tolerance` of pixels differing by more than `channel_tolerance` per
 channel — not a perceptual metric, but enough to absorb the level or two that
 text rendering moves between runs. Pin the window first; a size mismatch is
-reported as exactly that. `GPUI_MCP_UPDATE_GOLDENS=1` accepts a change instead
-of failing. Answered by the server, so the golden files live beside the script.
+reported as exactly that (`compared: false`, nothing counted), and the message
+says whether it looks like an unpinned window or a display with a different
+scale factor — a golden is in device pixels. `GPUI_MCP_UPDATE_GOLDENS=1`
+accepts a change instead of failing. Answered by the server, so the golden
+files live beside the script: called as a tool the path is relative to the
+server's working directory, and when recorded it is rewritten relative to the
+script file, which is also how a replay resolves it.
 
 **`gpui_guide`** — `{"topic": "recipes"}`
 This documentation. Answered by the server itself, so it works even when no
@@ -764,8 +773,10 @@ was made at and replay applies it before the first step:
 ```
 
 Use `set_viewport` to pin it yourself before recording something you intend to
-keep. A window that cannot be resized aborts the replay rather than producing
-failures that all describe the wrong problem.
+keep. A window that cannot be resized, or that the platform left at another
+size (`honoured: false`), aborts the replay rather than producing failures that
+all describe the wrong problem; the report says so in `viewport`, and the CLI
+prints it as line 0.
 
 **The starting state** only the app can define. When it has registered a hook,
 `reset_app` is a step a script can take; without one the call fails and says
@@ -775,12 +786,15 @@ a green run hiding a bug.
 **What it looks like** is `expect_screenshot`:
 
 ```json
-{"method": "expect_screenshot", "params": {"path": "tests/golden/sidebar.png"}}
+{"method": "expect_screenshot", "params": {"path": "golden/sidebar.png"}}
 ```
 
-First run writes the golden and says there was nothing to compare against.
-Later runs compare, and a failure writes this run beside it as
-`<name>.actual.png`. Set `GPUI_MCP_UPDATE_GOLDENS=1` to accept a change.
+In a script the path is relative to the script file — the recorder writes it
+that way, so the goldens travel with the script. First run writes the golden
+and says there was nothing to compare against; the step passes with that
+message rather than a bare "passed". Later runs compare, and a failure writes
+this run beside it as `<name>.actual.png`. Set `GPUI_MCP_UPDATE_GOLDENS=1` to
+accept a change.
 
 ## In CI, without an agent
 
@@ -875,21 +889,23 @@ mod tests {
     }
 
     /// The guide is only useful while it still describes the tools that exist.
-    /// A new method that nobody documented fails here rather than silently
-    /// leaving the agent to discover it.
+    /// A new tool that nobody documented fails here rather than silently
+    /// leaving the agent to discover it — the server's own tools included,
+    /// which are not IPC methods and would otherwise slip past.
     #[test]
-    fn the_tools_topic_documents_every_method() {
+    fn the_tools_topic_documents_every_tool() {
         let body = topic("tools").expect("tools topic").body;
-        for method in methods::ALL {
+        let server_local = [
+            TOOL_NAME,
+            crate::script::REPLAY_TOOL,
+            crate::golden::TOOL_NAME,
+        ];
+        for tool in methods::ALL.iter().chain(server_local.iter()) {
             assert!(
-                body.contains(method),
-                "method '{method}' is not documented in the 'tools' topic"
+                body.contains(&format!("**`{tool}`**")),
+                "tool '{tool}' has no entry in the 'tools' topic"
             );
         }
-        assert!(
-            body.contains(TOOL_NAME),
-            "the guide tool itself is not documented"
-        );
     }
 
     /// `INSTRUCTIONS` is in context for the whole session, so it has a budget.

@@ -14,9 +14,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Name of the tool that replays a recorded script. Server-local, like the
+/// guide: it drives the app through the other tools rather than being one of
+/// them.
+pub const REPLAY_TOOL: &str = "replay_script";
+
 /// A recorded session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Script {
+    /// Where the file was read from, when it was. Not part of the file: it is
+    /// what a relative golden path is relative to, so the goldens travel with
+    /// the script instead of depending on the directory a replay is started
+    /// from.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
     /// Free-form, for whoever reads the file. Defaults to the file stem.
     #[serde(default)]
     pub name: String,
@@ -62,7 +73,7 @@ pub struct Step {
 pub const READ_ONLY: &[&str] = &[
     "a11y_audit",
     "a11y_tree",
-    "expect_screenshot",
+    crate::golden::TOOL_NAME,
     "get_windows",
     "get_app_state",
     "get_logs",
@@ -74,30 +85,125 @@ pub const READ_ONLY: &[&str] = &[
 ];
 
 /// Tools that are the server's own and mean nothing to a replay.
-pub const NOT_RECORDED: &[&str] = &["gpui_guide", "replay_script"];
+pub const NOT_RECORDED: &[&str] = &[crate::docs::TOOL_NAME, REPLAY_TOOL];
 
 pub fn is_read_only(method: &str) -> bool {
     READ_ONLY.contains(&method)
+}
+
+/// Create the directory a file is about to be written into. A script and the
+/// goldens beside it are written the same way.
+pub fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
 }
 
 impl Script {
     pub fn read(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Cannot read script {}: {}", path.display(), e))?;
-        let script: Script = serde_json::from_str(&text)
+        let mut script: Script = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("{} is not a gpui-mcp script: {}", path.display(), e))?;
+        script.source = Some(path.to_path_buf());
         Ok(script)
     }
 
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+        ensure_parent_dir(path)?;
         std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(self)?))?;
         Ok(())
     }
+
+    /// The directory relative golden paths are resolved against: the script's
+    /// own, when it is known.
+    fn base_dir(&self) -> Option<&Path> {
+        self.source
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|dir| !dir.as_os_str().is_empty())
+    }
+
+    /// A step's params as the tool should see them. The one rewrite: a golden
+    /// path is relative to the script file, and the tool knows nothing about
+    /// scripts, so it is made relative to the working directory here.
+    fn params_for(&self, step: &Step) -> serde_json::Value {
+        let mut params = step.params.clone();
+        if step.method != crate::golden::TOOL_NAME {
+            return params;
+        }
+        let Some(dir) = self.base_dir() else {
+            return params;
+        };
+        if let Some(path) = params.get("path").and_then(|path| path.as_str()) {
+            // `has_root`, not `is_relative`: on Windows `/abs/x.png` is not
+            // absolute, and is still not a path to hang off the script.
+            if !Path::new(path).has_root() {
+                // Folded, so `../scripts/../golden/x.png` reads as the
+                // `../golden/x.png` it is when it comes back in a message.
+                params["path"] = serde_json::json!(normalise(&dir.join(path)).to_string_lossy());
+            }
+        }
+        params
+    }
+}
+
+/// `target` written relative to `base`, both absolute — the way a golden path
+/// is written into a script so it still resolves when the script moves.
+///
+/// `None` when no relative path exists (a different drive on Windows), in
+/// which case the absolute path is the honest thing to write.
+pub fn relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let (base, target) = (normalise(base), normalise(target));
+    let base: Vec<Component> = base.components().collect();
+    let target: Vec<Component> = target.components().collect();
+
+    // Prefix and root have to agree, or there is no path from one to the other.
+    let is_anchor = |c: &Component| matches!(c, Component::Prefix(_) | Component::RootDir);
+    let base_anchor: Vec<&Component> = base.iter().filter(|c| is_anchor(c)).collect();
+    let target_anchor: Vec<&Component> = target.iter().filter(|c| is_anchor(c)).collect();
+    if base_anchor != target_anchor {
+        return None;
+    }
+
+    let shared = base
+        .iter()
+        .zip(target.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut relative = PathBuf::new();
+    for _ in shared..base.len() {
+        relative.push("..");
+    }
+    for component in &target[shared..] {
+        relative.push(component);
+    }
+    Some(relative)
+}
+
+/// Fold `.` and `..` so that two spellings of one directory compare equal.
+fn normalise(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Appends every tool call to a script file as it happens.
@@ -108,6 +214,10 @@ impl Script {
 pub struct Recorder {
     path: PathBuf,
     script: Script,
+    /// Whether the window size has been asked for yet. Asked once: a session
+    /// against an app with no window would otherwise pay a discovery and a
+    /// round trip on every step for the rest of its life.
+    viewport_probed: bool,
     /// `e7` -> `save-button`, learned from the last snapshot this server sent.
     /// Only ids that appeared once in that snapshot: see [`Recorder::learn_refs`].
     refs: HashMap<String, String>,
@@ -128,8 +238,8 @@ impl Recorder {
             .to_string();
 
         Self {
-            path,
             script: Script {
+                source: Some(path.clone()),
                 name,
                 app,
                 recorded_with: Some(format!(
@@ -140,6 +250,8 @@ impl Recorder {
                 viewport: None,
                 steps: Vec::new(),
             },
+            path,
+            viewport_probed: false,
             refs: HashMap::new(),
             ambiguous: HashMap::new(),
             id_counts: HashMap::new(),
@@ -150,20 +262,28 @@ impl Recorder {
         &self.path
     }
 
-    /// The size this script will be replayed at, if it is known yet.
-    pub fn viewport(&self) -> Option<Viewport> {
-        self.script.viewport
+    /// Whether the window size still has to be asked for. True exactly once.
+    pub fn needs_viewport(&self) -> bool {
+        !self.viewport_probed
     }
 
-    /// Record the window size the session is happening at.
+    /// Record the window size the session is happening at, or that it could
+    /// not be read. Returns whether a size was written.
     ///
     /// Written once, from the first window seen, and never revised: a script
     /// records the size it was *made* at. A later resize is a step in the
     /// script, and rewriting the header to match it would quietly make the
     /// header agree with whatever happened last.
-    pub fn note_viewport(&mut self, width: f32, height: f32) {
-        if self.script.viewport.is_none() && width >= 1.0 && height >= 1.0 {
-            self.script.viewport = Some(Viewport { width, height });
+    pub fn note_viewport(&mut self, size: Option<(f32, f32)>) -> bool {
+        self.viewport_probed = true;
+        match size {
+            Some((width, height))
+                if self.script.viewport.is_none() && width >= 1.0 && height >= 1.0 =>
+            {
+                self.script.viewport = Some(Viewport { width, height });
+                true
+            }
+            _ => false,
         }
     }
 
@@ -187,7 +307,10 @@ impl Recorder {
             self.learn_refs(snapshot);
         }
 
-        let (params, note) = self.resolve_refs(params.clone());
+        let (mut params, note) = self.resolve_refs(params.clone());
+        if method == crate::golden::TOOL_NAME {
+            self.anchor_golden_path(&mut params);
+        }
         self.script.steps.push(Step {
             method: method.to_string(),
             params,
@@ -195,6 +318,35 @@ impl Recorder {
         });
 
         self.script.write(&self.path)
+    }
+
+    /// Write a golden path relative to the script rather than to wherever this
+    /// server happened to be started.
+    ///
+    /// The agent named the golden relative to the server's working directory,
+    /// which is whatever the MCP client chose and is not written down anywhere.
+    /// Relative to the script, the same path means the same file from any
+    /// directory a replay is started in — and when no relative path exists
+    /// (another drive), the absolute one is written, which is at least honest.
+    fn anchor_golden_path(&self, params: &mut serde_json::Value) {
+        let Some(path) = params.get("path").and_then(|path| path.as_str()) else {
+            return;
+        };
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        let target = cwd.join(path);
+        let base = cwd.join(self.path.parent().unwrap_or(Path::new("")));
+
+        // Two spellings of one directory — a symlink, an 8.3 short name on
+        // Windows — would otherwise share no prefix and produce a relative
+        // path that climbs to the root and back down. Both exist by now: the
+        // golden was just written, and the script file with it.
+        let canonical =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+        let written = relative_path(&canonical(&base), &canonical(&target)).unwrap_or(target);
+        params["path"] = serde_json::json!(written.to_string_lossy());
     }
 
     /// Read `#test-id` and `@ref` off each snapshot line, so a ref recorded
@@ -335,7 +487,7 @@ fn parse_snapshot_line(line: &str) -> Option<(&str, &str)> {
 }
 
 /// How to replay a script.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ReplayOptions {
     /// Skip the steps that only look at the app. Getting somewhere is the
     /// point; re-reading the tree on the way is pure cost.
@@ -344,6 +496,17 @@ pub struct ReplayOptions {
     /// batch does: the steps after a failure are acting on a state nobody
     /// intended.
     pub stop_on_error: bool,
+}
+
+impl Default for ReplayOptions {
+    /// A test run: every step, stopping at the first failure — what the tool
+    /// and the command line both do unless told otherwise.
+    fn default() -> Self {
+        Self {
+            seek: false,
+            stop_on_error: true,
+        }
+    }
 }
 
 /// What one step did.
@@ -356,7 +519,25 @@ pub struct StepOutcome {
     pub detail: Option<String>,
 }
 
+/// What applying [`Script::viewport`] did. It happens before step one and is
+/// reported before it, as the CLI's line 0.
+#[derive(Debug, Clone, Serialize)]
+pub struct ViewportOutcome {
+    /// `applied` or `failed`.
+    pub status: &'static str,
+    pub requested: Viewport,
+    /// The size the window actually reached, when the app said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reached: Option<Viewport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// What the whole replay did.
+///
+/// The counts are about the steps and always add up to `of`. The viewport
+/// header is not a step: its outcome is `viewport`, and `ok` covers both — a
+/// header that failed is `ok: false` with `failed: 0` and every step skipped.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub ok: bool,
@@ -366,7 +547,7 @@ pub struct Report {
     pub of: usize,
     /// What applying [`Script::viewport`] did, when the script carried one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub viewport: Option<serde_json::Value>,
+    pub viewport: Option<ViewportOutcome>,
     pub steps: Vec<StepOutcome>,
 }
 
@@ -386,26 +567,24 @@ pub fn replay(
 
     // Before anything else, because everything after it depends on the
     // layout: a script recorded at one size and replayed at another is not
-    // replaying the same UI. A window that cannot be resized aborts the run
-    // rather than producing failures that all say the wrong thing.
+    // replaying the same UI. A window that cannot be resized — refused as
+    // well as unreachable — aborts the run rather than producing failures
+    // that all say the wrong thing.
     let mut viewport = None;
     if let Some(size) = script.viewport {
-        match call(
-            "set_viewport",
-            serde_json::json!({ "width": size.width, "height": size.height }),
-        ) {
-            Ok(value) => viewport = Some(value),
-            Err(error) => {
-                return Report {
-                    ok: false,
-                    passed: 0,
-                    failed: 1,
-                    skipped: script.steps.len(),
-                    of: script.steps.len(),
-                    viewport: Some(serde_json::json!({ "error": error.to_string() })),
-                    steps: Vec::new(),
-                };
-            }
+        let outcome = apply_viewport(size, &mut call);
+        let failed = outcome.status == "failed";
+        viewport = Some(outcome);
+        if failed {
+            return Report {
+                ok: false,
+                passed: 0,
+                failed: 0,
+                skipped: script.steps.len(),
+                of: script.steps.len(),
+                viewport,
+                steps: Vec::new(),
+            };
         }
     }
 
@@ -421,22 +600,22 @@ pub fn replay(
             continue;
         }
 
-        let outcome = match call(&step.method, step.params.clone()) {
+        let outcome = match call(&step.method, script.params_for(step)) {
             Err(error) => Err(error.to_string()),
             Ok(value) => match unmet_expectation(&step.method, &value) {
                 Some(reason) => Err(reason),
-                None => Ok(()),
+                None => Ok(passing_note(&step.method, &value)),
             },
         };
 
         match outcome {
-            Ok(()) => {
+            Ok(detail) => {
                 passed += 1;
                 steps.push(StepOutcome {
                     index,
                     method: step.method.clone(),
                     status: "passed",
-                    detail: None,
+                    detail,
                 });
             }
             Err(detail) => {
@@ -465,9 +644,89 @@ pub fn replay(
     }
 }
 
+/// Pin the window to the script's size, and say what happened.
+fn apply_viewport(
+    size: Viewport,
+    call: &mut impl FnMut(&str, serde_json::Value) -> anyhow::Result<serde_json::Value>,
+) -> ViewportOutcome {
+    match call(
+        "set_viewport",
+        serde_json::json!({ "width": size.width, "height": size.height }),
+    ) {
+        Err(error) => ViewportOutcome {
+            status: "failed",
+            requested: size,
+            reached: None,
+            detail: Some(error.to_string()),
+        },
+        Ok(value) => {
+            let refused = refused_resize(&value);
+            ViewportOutcome {
+                status: if refused.is_some() {
+                    "failed"
+                } else {
+                    "applied"
+                },
+                requested: size,
+                reached: serde_json::from_value(value["viewport"].clone()).ok(),
+                detail: refused,
+            }
+        }
+    }
+}
+
+/// A `set_viewport` answer that says the window is not the size it was asked
+/// to be. The call succeeded; the resize did not, and a script that carries
+/// on is replaying a different layout.
+fn refused_resize(value: &serde_json::Value) -> Option<String> {
+    if value.get("honoured") != Some(&serde_json::json!(false)) {
+        return None;
+    }
+    // Sizes arrive as JSON numbers, and `1280.0x800.0` is not how anyone says
+    // a window size.
+    let size = |key: &str| {
+        let side = |side: &str| {
+            value[key][side]
+                .as_f64()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into())
+        };
+        format!("{}x{}", side("width"), side("height"))
+    };
+    Some(format!(
+        "asked for {} and the window reached {}: the platform refused or clamped the resize — \
+         a minimum size, a maximised window, or a tiling window manager. The layout is not the \
+         one the script was recorded against.",
+        size("requested"),
+        size("viewport")
+    ))
+}
+
+/// Something a passing step should still say. A golden that was written
+/// rather than compared passed without proving anything, and a report that
+/// printed a bare `passed` for it would hide exactly the run that needs a
+/// look.
+fn passing_note(method: &str, value: &serde_json::Value) -> Option<String> {
+    let not_compared = value.get("created") == Some(&serde_json::json!(true))
+        || value.get("compared") == Some(&serde_json::json!(false));
+    if method != crate::golden::TOOL_NAME || !not_compared {
+        return None;
+    }
+    Some(
+        value
+            .get("detail")
+            .and_then(|detail| detail.as_str())
+            .unwrap_or("the golden was written, not compared")
+            .to_string(),
+    )
+}
+
 /// A step that succeeded as a call but did not say what the script expects.
 fn unmet_expectation(method: &str, value: &serde_json::Value) -> Option<String> {
     match method {
+        // A recorded resize that the platform refused leaves every later step
+        // on a layout the script did not mean, the same as a refused header.
+        "set_viewport" => refused_resize(value),
         "wait_for" if value.get("satisfied") == Some(&serde_json::json!(false)) => Some(format!(
             "waited {} ms and the condition never held: {}",
             value.get("waited_ms").unwrap_or(&serde_json::json!(0)),
@@ -633,6 +892,7 @@ mod tests {
 
     fn script_of(steps: &[(&str, serde_json::Value)]) -> Script {
         Script {
+            source: None,
             name: "test".into(),
             app: None,
             recorded_with: None,
@@ -960,14 +1220,28 @@ mod tests {
         assert!(detail.contains("actual.png"), "{detail}");
     }
 
-    /// The first run of a golden has nothing to compare against and passes.
+    /// The first run of a golden has nothing to compare against and passes —
+    /// but a bare "passed" would hide exactly the run that needs a look, so
+    /// the step carries what the comparison said.
     #[test]
-    fn a_freshly_written_golden_passes() {
+    fn a_freshly_written_golden_passes_and_says_so() {
         let script = script_of(&[("expect_screenshot", json!({ "path": "g.png" }))]);
         let report = replay(&script, &ReplayOptions::default(), |_, _| {
-            Ok(json!({ "matched": true, "created": true }))
+            Ok(json!({ "matched": true, "created": true, "detail": "Wrote g.png" }))
         });
         assert!(report.ok);
+        assert_eq!(report.steps[0].status, "passed");
+        assert_eq!(report.steps[0].detail.as_deref(), Some("Wrote g.png"));
+    }
+
+    #[test]
+    fn a_compared_golden_that_matches_says_nothing() {
+        let script = script_of(&[("expect_screenshot", json!({ "path": "g.png" }))]);
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Ok(json!({ "matched": true, "created": false, "compared": true }))
+        });
+        assert!(report.ok);
+        assert!(report.steps[0].detail.is_none());
     }
 
     /// Seeking is about arriving. A golden is an assertion about the way
@@ -975,5 +1249,261 @@ mod tests {
     #[test]
     fn seeking_does_not_compare_goldens() {
         assert!(is_read_only("expect_screenshot"));
+    }
+
+    /// The call succeeded and the resize did not. Carrying on would replay
+    /// every later step against a layout the script never meant, so this is
+    /// the same abort as a window that could not be reached at all.
+    #[test]
+    fn a_refused_resize_stops_the_replay() {
+        let mut script = script_of(&[("click_element", json!({ "element_id": "save" }))]);
+        script.viewport = Some(Viewport {
+            width: 1280.0,
+            height: 800.0,
+        });
+
+        let mut called = Vec::new();
+        let report = replay(&script, &ReplayOptions::default(), |method, _| {
+            called.push(method.to_string());
+            Ok(json!({
+                "honoured": false,
+                "requested": { "width": 1280.0, "height": 800.0 },
+                "viewport": { "width": 1920.0, "height": 1080.0 },
+            }))
+        });
+
+        assert!(!report.ok);
+        assert_eq!(called, ["set_viewport"], "nothing else ran");
+        let viewport = report.viewport.as_ref().unwrap();
+        assert_eq!(viewport.status, "failed");
+        assert_eq!(
+            viewport.reached,
+            Some(Viewport {
+                width: 1920.0,
+                height: 1080.0
+            })
+        );
+        let detail = viewport.detail.as_deref().unwrap();
+        assert!(detail.contains("1280x800"), "{detail}");
+        assert!(detail.contains("1920x1080"), "{detail}");
+        assert!(detail.contains("refused"), "{detail}");
+    }
+
+    /// The header is not a step, so a header that fails must not be counted
+    /// as one: the counts describe the steps and add up to `of`, and the
+    /// reason lives in the report where a reader can find it.
+    #[test]
+    fn a_failed_header_keeps_the_counts_honest() {
+        let mut script = script_of(&[
+            ("click_element", json!({ "element_id": "save" })),
+            ("wait_for", json!({ "text": "Saved" })),
+        ]);
+        script.viewport = Some(Viewport {
+            width: 1280.0,
+            height: 800.0,
+        });
+
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Err(anyhow::anyhow!("Window not found"))
+        });
+
+        assert!(!report.ok);
+        assert_eq!(
+            report.passed + report.failed + report.skipped,
+            report.of,
+            "{report:?}"
+        );
+        assert_eq!(report.failed, 0, "the header is not a step");
+        assert_eq!(report.skipped, 2);
+        let viewport = report.viewport.as_ref().unwrap();
+        assert_eq!(viewport.status, "failed");
+        assert!(viewport.reached.is_none());
+        assert!(viewport
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("Window not found"));
+    }
+
+    /// A resize recorded as a step can be refused just like the header.
+    #[test]
+    fn a_recorded_resize_the_platform_refused_fails_the_step() {
+        let script = script_of(&[
+            ("set_viewport", json!({ "width": 600, "height": 400 })),
+            ("click_element", json!({ "element_id": "save" })),
+        ]);
+
+        let report = replay(&script, &ReplayOptions::default(), |method, _| {
+            Ok(match method {
+                "set_viewport" => json!({
+                    "honoured": false,
+                    "requested": { "width": 600.0, "height": 400.0 },
+                    "viewport": { "width": 800.0, "height": 600.0 },
+                }),
+                _ => json!({ "success": true }),
+            })
+        });
+
+        assert!(!report.ok);
+        assert_eq!(report.steps[0].status, "failed");
+        assert_eq!(report.steps.len(), 1, "stopped there");
+    }
+
+    /// A golden named in a script is relative to the script, so the same
+    /// file resolves from whichever directory the replay is started in.
+    #[test]
+    fn a_golden_path_is_resolved_against_the_script() {
+        let mut script = script_of(&[
+            ("expect_screenshot", json!({ "path": "golden/sidebar.png" })),
+            ("expect_screenshot", json!({ "path": "/abs/elsewhere.png" })),
+            (
+                "click_element",
+                json!({ "element_id": "golden/sidebar.png" }),
+            ),
+        ]);
+        script.source = Some(PathBuf::from("tests/open-file.json"));
+
+        let mut seen = Vec::new();
+        let report = replay(&script, &ReplayOptions::default(), |method, params| {
+            seen.push((method.to_string(), params));
+            Ok(json!({ "matched": true, "compared": true }))
+        });
+
+        assert!(report.ok);
+        assert_eq!(
+            Path::new(seen[0].1["path"].as_str().unwrap()),
+            Path::new("tests/golden/sidebar.png")
+        );
+        assert_eq!(seen[1].1["path"], "/abs/elsewhere.png", "absolute stays");
+        assert_eq!(
+            seen[2].1["element_id"], "golden/sidebar.png",
+            "only a golden's path is a path"
+        );
+    }
+
+    /// A script that was never read from a file has nothing to resolve
+    /// against, and leaves the path alone.
+    #[test]
+    fn a_script_without_a_source_leaves_golden_paths_alone() {
+        let script = script_of(&[("expect_screenshot", json!({ "path": "golden/s.png" }))]);
+        let mut seen = None;
+        replay(&script, &ReplayOptions::default(), |_, params| {
+            seen = Some(params);
+            Ok(json!({ "matched": true }))
+        });
+        assert_eq!(seen.unwrap()["path"], "golden/s.png");
+    }
+
+    #[test]
+    fn a_relative_path_walks_from_the_base_to_the_target() {
+        let (base, target) = if cfg!(windows) {
+            ("C:\\repo\\tests", "C:\\repo\\tests\\golden\\s.png")
+        } else {
+            ("/repo/tests", "/repo/tests/golden/s.png")
+        };
+        assert_eq!(
+            relative_path(Path::new(base), Path::new(target)),
+            Some(PathBuf::from("golden").join("s.png"))
+        );
+
+        let (base, target) = if cfg!(windows) {
+            (
+                "C:\\repo\\scripts\\.",
+                "C:\\repo\\tests\\..\\tests\\golden\\s.png",
+            )
+        } else {
+            ("/repo/scripts/.", "/repo/tests/../tests/golden/s.png")
+        };
+        assert_eq!(
+            relative_path(Path::new(base), Path::new(target)),
+            Some(
+                PathBuf::from("..")
+                    .join("tests")
+                    .join("golden")
+                    .join("s.png")
+            )
+        );
+    }
+
+    /// Two drives have no path between them; the absolute path is what is
+    /// left, and writing it is better than writing something that is wrong.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_across_drives_has_no_relative_form() {
+        assert_eq!(
+            relative_path(Path::new("C:\\repo"), Path::new("D:\\golden\\s.png")),
+            None
+        );
+    }
+
+    /// The agent names a golden relative to wherever the MCP client started
+    /// the server, and that directory is written down nowhere. The recorder
+    /// re-anchors it on the script, which is where the golden is looked for.
+    #[test]
+    fn a_recorded_golden_path_is_anchored_on_the_script() {
+        let path = temp_path("golden-anchor");
+        let mut recorder = Recorder::new(&path, None);
+
+        recorder
+            .record(
+                "expect_screenshot",
+                &json!({ "path": "tests/golden/sidebar.png" }),
+                None,
+            )
+            .unwrap();
+
+        let written = Script::read(&path).unwrap();
+        let recorded = PathBuf::from(written.steps[0].params["path"].as_str().unwrap());
+        let meant = normalise(
+            &std::env::current_dir()
+                .unwrap()
+                .join("tests/golden/sidebar.png"),
+        );
+
+        if recorded.is_relative() {
+            let script_dir = path.parent().unwrap();
+            assert_eq!(normalise(&script_dir.join(&recorded)), meant);
+        } else {
+            // The temp directory and the working directory are on different
+            // drives, so an absolute path was the only honest choice.
+            assert_eq!(normalise(&recorded), meant);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// One probe. A window that is not there on the first recorded step is
+    /// not worth a discovery and a round trip on every step after it.
+    #[test]
+    fn the_window_size_is_asked_for_once() {
+        let path = temp_path("probe");
+        let mut recorder = Recorder::new(&path, None);
+
+        assert!(recorder.needs_viewport());
+        assert!(!recorder.note_viewport(None), "nothing to write");
+        assert!(!recorder.needs_viewport(), "and no second probe");
+
+        let mut recorder = Recorder::new(&path, None);
+        assert!(
+            !recorder.note_viewport(Some((0.0, 0.0))),
+            "a minimised window has no size"
+        );
+        assert!(!recorder.needs_viewport());
+
+        let mut recorder = Recorder::new(&path, None);
+        assert!(recorder.note_viewport(Some((1280.0, 800.0))));
+        recorder
+            .record("send_key", &json!({ "key": "enter" }), None)
+            .unwrap();
+        let written = Script::read(&path).unwrap();
+        assert_eq!(
+            written.viewport,
+            Some(Viewport {
+                width: 1280.0,
+                height: 800.0
+            })
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }

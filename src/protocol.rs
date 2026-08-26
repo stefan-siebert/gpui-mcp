@@ -158,13 +158,27 @@ pub struct UiTree {
     pub timestamp: u64,
 }
 
+/// A width and a height, in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Size {
+    pub width: f32,
+    pub height: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowInfo {
     pub id: String,
     pub title: String,
+    /// The outer window frame. On macOS this includes the title bar, so it is
+    /// not the size layout sees — that is [`WindowInfo::content_size`].
     pub bounds: Bounds,
     pub is_active: bool,
     pub display_id: Option<usize>,
+    /// The drawable area: what layout sees, what a screenshot renders, and
+    /// what [`methods::SET_VIEWPORT`] sets. Absent from an older app, in which
+    /// case `bounds` is the best guess available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_size: Option<Size>,
 }
 
 /// Result of [`methods::TAKE_SCREENSHOT`].
@@ -185,6 +199,12 @@ pub struct ScreenshotResult {
     /// Set when the screenshot was cropped to an element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_id: Option<String>,
+    /// The display's device scale factor the window was rendered at: a
+    /// 1280x800 window is a 1920x1200 image at 1.5. `width` and `height` are
+    /// device pixels, and this is what relates them to the logical size a
+    /// viewport is given in. Absent from an older app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_factor: Option<f32>,
 }
 
 /// Params for [`methods::CLICK_ELEMENT`]: either `element_id` or `x`/`y`.

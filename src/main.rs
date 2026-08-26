@@ -15,7 +15,8 @@ mod docs;
 mod golden;
 mod script;
 
-use script::{Recorder, ReplayOptions, Script};
+use golden::TOOL_NAME as GOLDEN_TOOL;
+use script::{Recorder, ReplayOptions, Report, Script, REPLAY_TOOL};
 
 /// MCP Server for GPUI inspection and automation.
 ///
@@ -175,6 +176,7 @@ fn resolve_socket_path() -> Result<String> {
 
 /// An image lifted out of a tool result and handed to the agent as its own
 /// content block.
+#[derive(Debug)]
 struct InlineImage {
     data: String,
     mime_type: String,
@@ -188,10 +190,7 @@ struct InlineImage {
 /// a file is at least diagnosable, where a silently missing image is not.
 fn inline_screenshot(result: &mut serde_json::Value) -> Option<InlineImage> {
     let shot: ScreenshotResult = serde_json::from_value(result.clone()).ok()?;
-
-    let bytes = std::fs::read(&shot.path).ok()?;
-    // The file is a temp handoff from the app; it is ours to delete.
-    let _ = std::fs::remove_file(&shot.path);
+    let bytes = take_handoff(&shot).ok()?;
 
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -209,6 +208,14 @@ fn inline_screenshot(result: &mut serde_json::Value) -> Option<InlineImage> {
         data,
         mime_type: format!("image/{}", shot.format),
     })
+}
+
+/// Read the image the app wrote for us, and take the file with it: it is a
+/// temp handoff, and ours to delete.
+fn take_handoff(shot: &ScreenshotResult) -> std::io::Result<Vec<u8>> {
+    let bytes = std::fs::read(&shot.path)?;
+    let _ = std::fs::remove_file(&shot.path);
+    Ok(bytes)
 }
 
 impl GpuiMcpServer {
@@ -285,6 +292,14 @@ impl GpuiMcpServer {
         // replay forwards every step through this function.
         if tool_name == GOLDEN_TOOL {
             return Ok((golden_result(self, &arguments)?, Vec::new()));
+        }
+        // The other two server-local tools are answered before a call gets
+        // here, so reaching this point with one means a script named it.
+        if script::NOT_RECORDED.contains(&tool_name) {
+            anyhow::bail!(
+                "{tool_name} is the server's own and cannot be a step of a script: it is never \
+                 recorded, and a replay that replayed a replay would not end"
+            );
         }
         if !methods::ALL.contains(&tool_name) {
             anyhow::bail!("Unknown tool: {}", tool_name);
@@ -378,16 +393,27 @@ fn snapshot_text(tool_name: &str, content: &serde_json::Value) -> Option<String>
     Some(format!("{header}\n{snapshot}"))
 }
 
-/// Name of the tool that replays a recorded script. Server-local, like the
-/// guide: it drives the app through the other tools rather than being one of
-/// them.
-const REPLAY_TOOL: &str = "replay_script";
-
-/// Replay a script file, forwarding each of its steps.
+/// Replay a script file, forwarding each of its steps through the app.
 ///
 /// There is no separate assertion step: a `wait_for` that comes back
 /// unsatisfied is a failed assertion, and already says which condition did not
-/// hold. So the same file both reaches a state and tests reaching it.
+/// hold. So the same file both reaches a state and tests reaching it. The
+/// tool and the command line share this; they differ only in how they print.
+fn replay_file(
+    server: &GpuiMcpServer,
+    path: &std::path::Path,
+    options: &ReplayOptions,
+) -> Result<(Script, Report)> {
+    let script = Script::read(path)?;
+    let report = script::replay(&script, options, |method, params| {
+        server
+            .handle_tool_call(method, params)
+            .map(|(value, _images)| value)
+    });
+    Ok((script, report))
+}
+
+/// Answer the `replay_script` tool.
 fn replay_result(
     server: &GpuiMcpServer,
     arguments: &serde_json::Value,
@@ -395,9 +421,8 @@ fn replay_result(
     let path = arguments
         .get("path")
         .and_then(|path| path.as_str())
-        .ok_or_else(|| anyhow::anyhow!("replay_script needs a `path` to a recorded script"))?;
+        .ok_or_else(|| anyhow::anyhow!("{REPLAY_TOOL} needs a `path` to a recorded script"))?;
 
-    let script = Script::read(std::path::Path::new(path))?;
     let options = ReplayOptions {
         seek: arguments
             .get("seek")
@@ -409,11 +434,7 @@ fn replay_result(
             .unwrap_or(true),
     };
 
-    let report = script::replay(&script, &options, |method, params| {
-        server
-            .handle_tool_call(method, params)
-            .map(|(value, _images)| value)
-    });
+    let (script, report) = replay_file(server, std::path::Path::new(path), &options)?;
 
     let mut result = serde_json::to_value(&report)?;
     if let Some(object) = result.as_object_mut() {
@@ -433,23 +454,20 @@ fn active_window_size(server: &GpuiMcpServer) -> Option<(f32, f32)> {
     let windows = server
         .send_ipc_request(methods::GET_WINDOWS, json!({}))
         .ok()?;
-    let windows = windows.as_array()?;
+    let windows: Vec<WindowInfo> = serde_json::from_value(windows).ok()?;
 
     let window = windows
         .iter()
-        .find(|window| window["is_active"] == json!(true))
+        .find(|window| window.is_active)
         .or_else(|| windows.first())?;
 
-    let bounds = window.get("bounds")?;
-    Some((
-        bounds.get("width")?.as_f64()? as f32,
-        bounds.get("height")?.as_f64()? as f32,
-    ))
+    // The content size is what `set_viewport` sets; the outer bounds are the
+    // fallback for an app too old to report it.
+    Some(match window.content_size {
+        Some(size) => (size.width, size.height),
+        None => (window.bounds.width, window.bounds.height),
+    })
 }
-/// Name of the tool that compares the window against a stored image.
-/// Server-local, like the guide and the replay: the golden files live beside
-/// the script, not inside the app.
-const GOLDEN_TOOL: &str = "expect_screenshot";
 
 /// Take a screenshot and compare it against a golden image.
 ///
@@ -468,30 +486,22 @@ fn golden_result(
         anyhow::bail!("{GOLDEN_TOOL} needs a `path` to the golden image");
     }
 
-    let mut shot_params = json!({ "max_width": 0 });
-    if let Some(element_id) = &expectation.element_id {
-        shot_params["element_id"] = json!(element_id);
-    }
-    if let Some(window_id) = &expectation.window_id {
-        shot_params["window_id"] = json!(window_id);
-    }
+    let shot_params = serde_json::to_value(TakeScreenshotParams {
+        max_width: Some(0),
+        element_id: expectation.element_id.clone(),
+        window_id: expectation.window_id.clone(),
+        ..Default::default()
+    })?;
 
     let shot = server.send_ipc_request(methods::TAKE_SCREENSHOT, shot_params)?;
     let shot: ScreenshotResult = serde_json::from_value(shot)
         .map_err(|e| anyhow::anyhow!("{GOLDEN_TOOL}: the screenshot answer: {e}"))?;
 
-    let bytes = std::fs::read(&shot.path)
+    let bytes = take_handoff(&shot)
         .map_err(|e| anyhow::anyhow!("Cannot read the new screenshot {}: {e}", shot.path))?;
-    // The file is a temp handoff from the app; it is ours to delete.
-    let _ = std::fs::remove_file(&shot.path);
 
-    let comparison = golden::compare(&expectation, &bytes)?;
-    let mut result = serde_json::to_value(&comparison)?;
-    if let Some(object) = result.as_object_mut() {
-        object.insert("width".into(), json!(shot.width));
-        object.insert("height".into(), json!(shot.height));
-    }
-    Ok(result)
+    let comparison = golden::compare(&expectation, &bytes, shot.scale_factor)?;
+    Ok(serde_json::to_value(&comparison)?)
 }
 /// A successful JSON-RPC result.
 fn ok_response(id: serde_json::Value, result: serde_json::Value) -> McpResponse {
@@ -685,7 +695,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_windows",
-                "description": "List all open GPUI windows with their ID, title, bounds, and active status. Use this first to discover window IDs for other tools. Returns: [{id, title, bounds: {x,y,width,height}, is_active}]. Example: {}",
+                "description": "List all open GPUI windows with their ID, title, bounds, and active status. Use this first to discover window IDs for other tools. Returns: [{id, title, bounds: {x,y,width,height}, content_size: {width,height}, is_active}]. bounds is the outer frame (on macOS including the title bar); content_size is what layout sees and what set_viewport sets. Example: {}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -1107,7 +1117,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "expect_screenshot",
-                "description": "Assert that the window still looks the way it looked: takes a full-size screenshot and compares it against a stored golden image. The first run writes the golden and says so — there was nothing to compare against, so look at it before trusting the next run. Later runs compare, and a failure writes the new image beside the golden as <name>.actual.png so both can be opened. Matching means: same size, and at most pixel_tolerance of pixels differing by more than channel_tolerance per channel — not a perceptual metric, but enough to absorb the level or two that text rendering moves between runs. Pin the window with set_viewport first; a different size is reported as exactly that. Re-run with GPUI_MCP_UPDATE_GOLDENS=1 to accept a change. Example: {\"path\": \"tests/golden/sidebar.png\"}",
+                "description": "Assert that the window still looks the way it looked: takes a full-size screenshot and compares it against a stored golden image. The first run writes the golden and says so — there was nothing to compare against, so look at it before trusting the next run. Later runs compare, and a failure writes the new image beside the golden as <name>.actual.png so both can be opened. Matching means: same size, and at most pixel_tolerance of pixels differing by more than channel_tolerance per channel — not a perceptual metric, but enough to absorb the level or two that text rendering moves between runs. Pin the window with set_viewport first; a different size is reported as exactly that, and the message says whether it looks like an unpinned window or a display with another scale factor. Re-run with GPUI_MCP_UPDATE_GOLDENS=1 to accept a change. The path is relative to the working directory here, and relative to the script file once recorded. Example: {\"path\": \"tests/golden/sidebar.png\"}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1153,9 +1163,10 @@ gpui-mcp-server — an MCP server for inspecting and driving a running GPUI app.
   gpui-mcp-server --help
 
 Environment:
-  GPUI_MCP_APP      restrict discovery to one app name
-  GPUI_MCP_PID      with GPUI_MCP_APP: one exact instance, no discovery
-  GPUI_MCP_RECORD   write every successful tool call to this script file
+  GPUI_MCP_APP             restrict discovery to one app name
+  GPUI_MCP_PID             with GPUI_MCP_APP: one exact instance, no discovery
+  GPUI_MCP_RECORD          write every successful tool call to this script file
+  GPUI_MCP_UPDATE_GOLDENS  1: rewrite golden images instead of failing against them
 ";
 
 /// The command-line side.
@@ -1197,30 +1208,38 @@ fn run_replay(arguments: &[String]) -> Result<()> {
     }
 
     let path = path.ok_or_else(|| anyhow::anyhow!("replay needs a script file"))?;
-    let script = Script::read(std::path::Path::new(path))?;
     let server = GpuiMcpServer::new();
+    let (script, report) = replay_file(&server, std::path::Path::new(path), &options)?;
 
-    let report = script::replay(&script, &options, |method, params| {
-        server
-            .handle_tool_call(method, params)
-            .map(|(value, _images)| value)
-    });
-
-    for step in &report.steps {
-        match &step.detail {
-            Some(detail) => println!(
-                "{:>3}  {:<7}  {} — {}",
-                step.index + 1,
-                step.status,
-                step.method,
-                detail
+    // The viewport header happens before step one, so it is line 0 — and it
+    // is printed at all because a header that failed is the whole story of
+    // a run in which every step reads "skipped".
+    if let Some(viewport) = &report.viewport {
+        print_line(
+            0,
+            viewport.status,
+            &format!(
+                "viewport {}x{}",
+                viewport.requested.width, viewport.requested.height
             ),
-            None => println!("{:>3}  {:<7}  {}", step.index + 1, step.status, step.method),
-        }
+            viewport.detail.as_deref(),
+        );
+    }
+    for step in &report.steps {
+        print_line(
+            step.index + 1,
+            step.status,
+            &step.method,
+            step.detail.as_deref(),
+        );
     }
 
+    let header = match &report.viewport {
+        Some(viewport) if viewport.status == "failed" => " — the viewport was not applied",
+        _ => "",
+    };
     println!(
-        "\n{}: {} passed, {} failed, {} skipped, of {}",
+        "\n{}: {} passed, {} failed, {} skipped, of {}{header}",
         script.name, report.passed, report.failed, report.skipped, report.of
     );
 
@@ -1228,6 +1247,14 @@ fn run_replay(arguments: &[String]) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// One line of the replay report.
+fn print_line(number: usize, status: &str, what: &str, detail: Option<&str>) {
+    match detail {
+        Some(detail) => println!("{number:>3}  {status:<7}  {what} — {detail}"),
+        None => println!("{number:>3}  {status:<7}  {what}"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -1411,10 +1438,14 @@ fn main() -> Result<()> {
                             // own. One extra round trip, once, costs about a
                             // millisecond and is what makes the replay
                             // reproduce the layout rather than approximate it.
-                            if recorder.viewport().is_none() {
-                                if let Some((width, height)) = active_window_size(&server) {
-                                    recorder.note_viewport(width, height);
-                                }
+                            if recorder.needs_viewport()
+                                && !recorder.note_viewport(active_window_size(&server))
+                            {
+                                eprintln!(
+                                    "[MCP] Could not read the window size, so {} carries no \
+                                     viewport and will replay at whatever size the window has.",
+                                    recorder.path().display()
+                                );
                             }
 
                             let snapshot =
@@ -1705,6 +1736,22 @@ mod tests {
             !script::NOT_RECORDED.contains(&GOLDEN_TOOL),
             "a golden check is an assertion the session made; it belongs in the script"
         );
+    }
+
+    /// A hand-written script can name them; the answer has to say why that
+    /// does not work rather than "Unknown tool" about a tool that is listed.
+    #[test]
+    fn a_script_cannot_step_through_the_servers_own_tools() {
+        let server = GpuiMcpServer::new();
+        for tool in [REPLAY_TOOL, docs::TOOL_NAME] {
+            let error = server
+                .handle_tool_call(tool, json!({}))
+                .expect_err("refused before any socket is touched");
+            assert!(
+                error.to_string().contains("server's own"),
+                "{tool}: {error}"
+            );
+        }
     }
 
     #[test]
