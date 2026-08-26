@@ -682,6 +682,20 @@ fn tools_list() -> serde_json::Value {
                 }
             },
             {
+                "name": "a11y_tree",
+                "description": "The accessibility tree for the window: what a screen reader would actually be handed. Real roles (Button, MenuBar, TextInput) rather than roles guessed from a filename, the label a control announces even when it paints no text, an input's current value, and the actions each node offers (Click, Focus, SetValue). GPUI builds this tree only while assistive technology is attached, so this turns it on for the window and waits a frame. It does NOT replace ui_snapshot: only elements somebody annotated get a node, so the tree is far smaller than the window — the answer says how many of the painted elements made it in. Each node carries the element id and source location, so a node can be matched to a snapshot line. Example: {}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "window_id": {
+                            "type": "string",
+                            "description": "Window to read (default: active window)"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "inspect_ui_tree",
                 "description": "Get the UI element hierarchy for debugging layout and structure. Each element has: id, element_type (derived from source file), bounds, source_location, children, properties. Use max_depth to limit tree size (default: unlimited). Use root_element_id to inspect a subtree instead of the whole app. Use format='compact' to strip verbose fields (bounds, content_mask, source_location, content_size). WARNING: Without filters this can return very large responses. Example: {\"max_depth\": 3, \"format\": \"compact\"}",
                 "inputSchema": {

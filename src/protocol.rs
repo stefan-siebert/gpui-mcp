@@ -225,6 +225,7 @@ pub mod methods {
     // Inspection
     pub const UI_SNAPSHOT: &str = "ui_snapshot";
     pub const A11Y_AUDIT: &str = "a11y_audit";
+    pub const A11Y_TREE: &str = "a11y_tree";
     pub const INSPECT_UI_TREE: &str = "inspect_ui_tree";
     pub const GET_ELEMENT: &str = "get_element";
     pub const GET_WINDOWS: &str = "get_windows";
@@ -249,6 +250,7 @@ pub mod methods {
         GET_WINDOWS,
         UI_SNAPSHOT,
         A11Y_AUDIT,
+        A11Y_TREE,
         INSPECT_UI_TREE,
         GET_ELEMENT,
         GET_FOCUS_INFO,
@@ -428,6 +430,25 @@ pub struct A11yAuditParams {
 
 /// WCAG 2.2 "Target Size (Minimum)", in pixels.
 pub const DEFAULT_MIN_TARGET_SIZE: f32 = 24.0;
+
+/// Params for [`methods::A11Y_TREE`].
+///
+/// The accessibility tree is what a screen reader is handed: real roles, the
+/// label a control announces, an input's value, what actions it offers. GPUI
+/// builds it only while an assistive technology is attached, so this method
+/// turns it on for the window and waits a frame for it to appear.
+///
+/// It is not a replacement for [`methods::UI_SNAPSHOT`] and does not try to
+/// be. Only elements somebody annotated get a node — on the gpui-component
+/// gallery that is eleven of ninety-six painted elements — so the snapshot
+/// remains the way to see everything, and this is the way to see what the
+/// annotated ones actually announce.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct A11yTreeParams {
+    /// Window to read (default: active window).
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
 
 /// How many findings an audit returns unless asked for more.
 pub const DEFAULT_MAX_FINDINGS: usize = 50;

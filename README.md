@@ -171,6 +171,7 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `ui_snapshot` | the window as one short line per meaningful element — `role "name" #test-id @ref` — with the layout scaffolding dropped. Start here: on a real UI it is a fraction of the tree's size |
 | `get_app_state` | window overview plus whatever the app's state provider returns (`app` key) |
 | `a11y_audit` | controls nothing can name, ids that name several elements, targets under 24px — the problems that hurt a screen-reader user and a script equally |
+| `a11y_tree` | the accessibility tree GPUI hands a screen reader: real roles, the label a control announces, an input value, the actions a node offers. Only annotated elements appear, so it complements `ui_snapshot` rather than replacing it |
 | `inspect_ui_tree` | the element hierarchy: id, type (from the source file), bounds, `source_location`, children, text. Filters: `max_depth`, `window_id`, `root_element_id`, `element_type_filter`, `text_filter`, `format: compact` |
 | `get_element` | one element with its full subtree |
 | `get_focus_info` | the focus handle and the active key-context chain — the first thing to check when a key binding does not fire |
@@ -291,6 +292,41 @@ this stays checked instead of having been checked once:
 ```json
 { "method": "a11y_audit", "params": { "fail_on": "serious" } }
 ```
+
+## The accessibility tree
+
+The audit above reads a *derived* layer: roles guessed from the file that
+rendered an element, names taken from the text it painted. GPUI also builds a
+real accessibility tree — the one AccessKit hands a screen reader — and
+`a11y_tree` returns it.
+
+It knows things the derived layer cannot:
+
+```
+Button  label "Edit"                         # paints an icon, announces a word
+TextInput  value ""  actions Focus, SetValue # what the field currently holds
+MenuBar                                      # a role nobody had to guess
+```
+
+Those four buttons the audit reports as `#menu` naming four elements are
+`GPUI Component`, `Edit`, `Window` and `Help` in this tree. The derived layer
+had nothing to tell them apart, because none of them paints text.
+
+The catch is coverage. GPUI builds a node only for elements somebody
+annotated, and against the gpui-component gallery that is **11 nodes over 96
+painted elements** — the sidebar's sixty-two rows have none. So the tree is
+not a smaller snapshot, it is a different, sparser view, and the answer says
+`nodes` against `painted` so that is visible rather than assumed. Use
+`ui_snapshot` to see the window and `a11y_tree` to see what the annotated part
+of it announces. Each node carries `element_id` and `source_location`, which
+is how a node is matched to a snapshot line.
+
+GPUI builds the tree only while assistive technology is attached, which is
+right for a shipping app and useless for checking one. The call therefore
+switches the window into building it and waits a frame — so the first
+`a11y_tree` on a window costs one frame more than the ones after it. This
+needs `Window::set_a11y_force_active`, which lives in the gpui fork this
+project builds against.
 
 ## Recording and replay
 

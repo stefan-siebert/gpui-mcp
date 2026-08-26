@@ -6,40 +6,87 @@ smaller payloads, and artefacts that double as tests.
 ## State of play
 
 Stages 0, 1, 3a and 4 are shipped and verified against a running app. Stage 2
-is half done: the derived half (2a) shipped, the annotated half (2b) is blocked
-on a decision, below.
+is done on both halves, but not the way this plan expected: the annotation
+layer 2b was going to build arrived in upstream gpui instead, so what shipped
+is a reader for it rather than a design of our own.
 
 | stage | what | state |
 |---|---|---|
 | 0 | the server documents itself to the agent | done |
 | 1 | frame-synchronous answers, `wait_for`, `batch` | done, protocol v2 |
 | 2a | `ui_snapshot`, roles derived from the source file, refs | done |
-| 2b | explicit `.a11y()` annotations: state, value, app-owned widgets | **blocked, needs a decision** |
+| 2b | annotations: real roles, labels, values, state | done via upstream AccessKit + `a11y_tree` |
+| 2c | folding the a11y tree into the snapshot and the audit | open, and now decidable |
 | 3a | recording a session, replaying it, the `replay` CLI | done |
 | 3b | pinned window size, golden screenshots, an app-side reset hook | open |
 | 4 | `a11y_audit`, and a failing audit failing a replay | done, minus what the derived layer cannot see |
 
-### The decision 2b is waiting on
+### What happened to 2b
 
-A generic `.a11y(...)` wrapper element **cannot** work: it receives its own
-`InspectorElementId`, whose path is built from its own source location, so it
-can never key a side table by the id of the `div` that registers the hitbox —
-and only elements with a hitbox appear in `inspector_elements()`.
-`with_inspector_state` does not help either; it only applies to the element the
-inspector is actively picking.
+This plan said a generic `.a11y(...)` wrapper cannot work, that the annotation
+has to ride on the element registering the hitbox, that this means fields on
+`Interactivity` in the zed fork, and that the cost was a heavier rebase — a
+call to make before 2b started.
 
-So the annotation has to ride on the element that registers the hitbox, which
-means `Interactivity` in gpui — a change in the zed fork:
+That call no longer exists. Upstream zed built the whole thing, and it reached
+the fork through the 2026-08-04 merge without a line of our own:
 
-1. fields on `Interactivity` plus a setter trait,
-2. carried through `insert_inspector_hitbox`,
-3. surfaced on `InspectorElementInfo`,
-4. then gpui-component's widgets fill them in.
+- `accesskit` in `crates/gpui/Cargo.toml` and a guide in `_accessibility.rs`,
+- `Element::a11y_role()`, and about twenty `aria_*` builders on
+  `Interactivity` — label, description, selected, expanded, toggled, value,
+  placeholder, orientation, level, position-in-set, row/column index and count,
+- action listeners and a focus-handle-to-node mapping,
+- `Window::debug_a11y_tree_json()`, which dumps the tree with each node's
+  `element_id` and `source_location` attached.
 
-The cost is a larger delta against upstream zed, and therefore a heavier
-rebase. That is the call to make before 2b starts. Everything 2b would unlock —
-`checked`/`selected`/`disabled`, an input's value, roles for app-owned widgets,
-contrast, per-element focus — is blocked behind it.
+gpui-component already fills it in: Button, ToggleButton, Checkbox, Radio,
+Switch, Tab, List, MenuItem and PopupMenu annotate themselves. That is very
+nearly the widget list this plan named as 2b's work.
+
+So everything 2b listed as blocked — `checked`/`selected`/`disabled`, an
+input's value, roles for app-owned widgets, per-element focus — was already
+there, behind one gate: GPUI builds the tree only while assistive technology is
+attached (`window.rs`, `if self.a11y.is_active()`), and the flag starts false
+and is set only by AccessKit's own callbacks.
+
+**What shipped instead of 2b:**
+
+- `Window::set_a11y_force_active(bool)` in the fork — a `force_enabled` flag
+  ORed into `sync_active_flag`, so `Application::new_inaccessible` still wins
+  and nothing changes for an app that never asks. Recorded in `FORK_CHANGES.md`.
+  Effective from the next frame, because the frame being painted latched its
+  answer before the first node was pushed.
+- `a11y_tree`, answered asynchronously: it switches the window into building
+  the tree, waits a frame, and returns it with `nodes` against `painted`.
+
+### The decision 2c is waiting on — with the evidence
+
+Whether the a11y tree replaces the derived layer or overlays it. Run against
+the gallery, the answer is legible:
+
+- **11 nodes over 96 painted elements.** The sidebar's sixty-two rows have no
+  node at all. The tree cannot be the spine; it is the sparser view.
+- **It knows what the derived layer cannot.** The four buttons `duplicate-id`
+  reports as `#menu` are `GPUI Component`, `Edit`, `Window` and `Help` in the
+  tree — none of them paints text, so 2a had nothing to tell them apart. The
+  search field carries `role: TextInput`, `value: ""`,
+  `on_action: [Focus, SetValue]`.
+- **The join is free.** Nodes carry `element_id` (`Name("menu")`,
+  `NamedInteger("input", 4294967299)`) and `source_location`. No geometry
+  matching is needed — the worry this plan recorded was unfounded.
+- **`NamedInteger("input", 4294967299)`** is `unstable-id` seen from the other
+  side: gpui itself prints the entity number as a separate field.
+
+So 2c is an overlay, not a replacement: `ui_snapshot` keeps the spine and takes
+role, name, value and state from the node where one exists; `a11y_audit` gains
+the checks that were listed as unshippable — state, and a control that is
+focusable with no node (which gpui already logs about). Contrast stays out:
+colours never reach this side.
+
+Worth deciding with it: whether a missing node becomes an audit finding. Only
+11 of 96 elements have one, so the check would fire on most of a normal UI —
+the same shape of finding as `unnamed-control`, and the same risk of being
+tuned out.
 
 ### Loose ends — closed
 
@@ -77,6 +124,15 @@ GPUI_MCP_APP=story ./target/release/gpui-mcp-server replay <script.json>
 
 Both halves must be rebuilt together after a protocol change; the version
 handshake will say so if they are not.
+
+There is a third checkout: `../gpui-fork`, the zed fork, which gpui-component
+patches in by path. `a11y_tree` depends on a change there
+(`Window::set_a11y_force_active`), so a build of the gallery is also the test
+of that patch. The fork's own workspace does not build on Windows — an
+unrelated dependency exceeds the path limit — so type-check gpui through
+gpui-component rather than with `cargo check -p gpui` in the fork. Anything
+added there belongs in the fork's `FORK_CHANGES.md`, which is what makes the
+next upstream rebase survivable.
 
 ## Why: where the time actually goes
 
@@ -185,16 +241,36 @@ file paints both a title bar and its close button; and an id segment counts as
 a `test_id` only when somebody clearly wrote it — lowercase, dashes or
 underscores — never `view-4294967734`, `1-0-0` or a type name.
 
-### 2b — annotated, for what cannot be derived — open
+### 2b — annotated, for what cannot be derived — **done, by upstream**
 
-A file name cannot say `checked`, `selected`, `disabled` or what an input
-currently holds, and an app's own widgets have no role at all. That needs an
-annotation in gpui-component — `.a11y(Role::Button, "Open file")`,
-`.test_id("open-file")` — recorded per frame and keyed by
-`InspectorElementId`, with gpui-component's Button, Input, Checkbox, List and
-Tab filling it in themselves. Duplicate `test_id`s within a window should be
-reported: the snapshot already prints them, and two elements called `#item`
-are only useful because the refs beside them are not.
+A file name cannot say `checked`, `selected` or `disabled`, cannot say what an
+input holds, and gives an app's own widgets no role at all. This plan proposed
+building that annotation ourselves. Upstream zed built it first — see *What
+happened to 2b* above for what arrived and what it cost.
+
+What the tree gives, read off the gallery: real roles (`Button`, `MenuBar`,
+`TextInput`) rather than roles inferred from a file name; the label a control
+announces when it paints only an icon; an input's `value`; the actions a node
+offers (`Click`, `Focus`, `SetValue`); and, per node, the `element_id` and
+`source_location` that tie it back to a snapshot line.
+
+What it does not give is coverage: a node exists only where somebody
+annotated the element, which on the gallery is 11 of 96 painted elements. The
+derived layer of 2a is therefore not superseded — it is what still sees the
+other 85. Folding the two together is 2c.
+
+### 2c — fold the tree into the snapshot and the audit — open
+
+`ui_snapshot` keeps the spine and takes role, name, value and state from a
+node where one exists, falling back to the derived guess where none does.
+`a11y_audit` gains state-aware checks and can report a focusable control with
+no node. The join key is `element_id` plus `source_location`; no geometry
+matching is needed.
+
+Two things to settle when it is built: whether a missing node is a finding at
+all — it would fire on most of a normal UI — and whether a snapshot line
+should say where its facts came from, since a derived role and an announced
+one are not the same claim.
 
 ## Stage 3 — Record and replay — **3a done**
 
@@ -261,9 +337,10 @@ step, so accessibility is part of a regression run rather than a thing checked
 once.
 
 Not shipped, because the derived layer cannot see it: contrast (no colours on
-this side), keyboard reachability and focus traps (focus is a `FocusHandle`,
-not an element), and anything about state. Contrast and state need stage 2b;
-focus needs a per-element focus id, which is the same fork change.
+this side), keyboard reachability and focus traps, and anything about state.
+Contrast stays out for good. State and focus do not: the a11y tree carries
+both — `selected`, `toggled`, `value`, and a node-to-focus-handle mapping — so
+they arrive with 2c rather than needing a fork change of their own.
 
 First run against the gpui-component gallery (upstream's demo, borrowed as a
 test subject): nine unnamed controls, `#menu` naming four buttons, `#item`

@@ -235,6 +235,21 @@ and does not check contrast. Options: `root_element_id`,
 `max_findings`. As a step in a recorded script, a failing audit fails the
 replay.
 
+**`a11y_tree`** — `{}`
+What a screen reader would actually be handed: real roles (`Button`,
+`MenuBar`, `TextInput`) instead of roles guessed from a file name, the label a
+control announces even when it paints no text, an input's current value, and
+the actions each node offers (`Click`, `Focus`, `SetValue`). GPUI builds this
+tree only while assistive technology is attached, so the call turns it on for
+the window and waits a frame.
+
+It does not replace `ui_snapshot`. Only elements somebody annotated get a
+node — on the gpui-component gallery, eleven of ninety-six painted elements —
+and the answer says so, with `nodes` against `painted`. Use it to see what the
+annotated elements announce, and the snapshot to see everything. Each node
+carries `element_id` and `source_location`, which is how a node lines up with
+a snapshot line.
+
 **`inspect_ui_tree`** — `{"max_depth": 3, "format": "compact"}`
 The element hierarchy. Options: `max_depth` (0 = unlimited), `window_id`,
 `root_element_id` (start at a subtree), `element_type_filter` (substring of the

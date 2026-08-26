@@ -41,6 +41,12 @@ MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJS
   [stefan-siebert/gpui-component](https://github.com/stefan-siebert/gpui-component),
   which depends on this repo by git (`package = "gpui-mcp-inspector"`, imports
   `gpui_mcp_protocol::protocol::*`).
+- Below that sits a third checkout, `../gpui-fork` (the zed fork, branch
+  `gpui-mcp-patches-v2`), which gpui-component patches in by path. `a11y_tree`
+  needs `Window::set_a11y_force_active` from it. A change there must be
+  recorded in the fork's `FORK_CHANGES.md`, and must be type-checked by
+  building gpui-component — the fork's own workspace does not build on Windows
+  (an unrelated dependency exceeds the path limit).
 
 ## Rules
 

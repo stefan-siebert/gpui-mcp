@@ -310,3 +310,43 @@ Because a failing audit fails a replay step, accessibility becomes part of a
 regression run rather than something that was checked once. That reuses the
 same rule as `wait_for`: a step that reports it is not satisfied is a failed
 expectation, and no new vocabulary was needed to say so.
+
+## The real accessibility tree, and why it is a second view
+
+`a11y_tree` returns what AccessKit hands a screen reader. It is tempting to
+treat it as a better snapshot and retire the derived layer, and the numbers say
+otherwise: against the gpui-component gallery it is **11 nodes over 96 painted
+elements**. A node exists only where somebody annotated the element, so the
+tree is not a cleaner view of the window — it is a view of the annotated part
+of it. The derived layer is what still sees the other 85, which is why both
+exist and why the answer reports `nodes` against `painted` rather than letting
+the tree pass for the UI.
+
+Where a node does exist it is strictly better, and in a way the derived layer
+cannot be talked into. The four title-bar buttons the audit reports as `#menu`
+paint no text at all; the tree names them `GPUI Component`, `Edit`, `Window`,
+`Help`. A role there is declared, not inferred from a filename. An input
+carries its `value`. None of that is guessable from a painted frame.
+
+Two decisions are load-bearing here:
+
+**The tree is switched on, not assumed.** GPUI builds it only while assistive
+technology is attached — correct for a shipping app, useless for checking one.
+`Window::set_a11y_force_active` in the gpui fork ORs a `force_enabled` flag into
+the activation check, leaving `Application::new_inaccessible` the final word and
+changing nothing for an app that never asks. This is the one place this project
+depends on a fork patch for a *feature* rather than for the inspector itself.
+
+**It takes effect from the next frame, so the method is asynchronous.** The
+frame being painted latched its answer before the first node was pushed, and
+the builder keeps a node stack that must be pushed and popped exactly once per
+frame — a mid-frame flip would corrupt it. So `a11y_tree` joins `wait_for` and
+`batch` as a method answered after a frame rather than from the one on screen,
+and the first call on a window costs one frame more than the ones after it.
+
+The join back to the snapshot is free rather than geometric: each node carries
+the `element_id` and `source_location` gpui recorded, so a node lines up with a
+snapshot line by name. An earlier reading of this design assumed the only
+available join was bounds-against-bounds, which would have been fuzzy enough to
+matter. It is worth noting that this per-node provenance is `debug_assertions`
+only — as is the whole inspector, so nothing is lost.

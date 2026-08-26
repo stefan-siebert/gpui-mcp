@@ -44,6 +44,7 @@ pub struct Step {
 /// them: re-reading the tree on the way to a state is pure cost.
 pub const READ_ONLY: &[&str] = &[
     "a11y_audit",
+    "a11y_tree",
     "get_windows",
     "get_app_state",
     "get_logs",
