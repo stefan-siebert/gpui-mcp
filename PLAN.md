@@ -297,20 +297,28 @@ three ways to drift, and each now has a fix.
   answers after the frame that shows it; a recorded script carries a
   `viewport` header and replay applies it before the first step. The recorder
   asks the app for the size once, so the header is there whether or not the
-  session ever looked at a window. A window that cannot be resized aborts the
-  replay instead of producing a run of failures that all describe the wrong
-  problem. `Window::resize` was already public in the fork — no patch needed.
+  session ever looked at a window. A window that cannot be resized — or that
+  the platform left at another size, `honoured: false` — aborts the replay
+  instead of producing a run of failures that all describe the wrong problem.
+  `Window::resize` was already public in the fork — no patch needed. The
+  size recorded and measured is the content size (`get_windows` now reports
+  `content_size` beside `bounds`), because on macOS the outer bounds include
+  the title bar.
 - **The starting state.** `mcp_set_reset_hook` in gpui-component, mirroring
   `mcp_set_app_state_provider`, and `reset_app` to call it. Without a hook the
   method fails and says what to register. That is deliberate: a replay which
   believes it started from a known state and did not is a green run hiding a
   bug, and a silent no-op would produce exactly that.
 - **What it looks like.** `expect_screenshot`, answered by the server so the
-  goldens live beside the script. First run writes the golden and says there
-  was nothing to compare against; later runs compare and a failure writes this
-  run beside it as `<name>.actual.png`. `GPUI_MCP_UPDATE_GOLDENS=1` accepts a
-  change — an environment variable rather than a step parameter, because a
-  script that could update its own golden would never fail.
+  goldens live beside the script — literally: in a script the golden path is
+  relative to the script file, written that way by the recorder and resolved
+  that way by replay. First run writes the golden and says there was nothing
+  to compare against, and the CLI prints that rather than a bare `passed`;
+  later runs compare and a failure writes this run beside it as
+  `<name>.actual.png`. `GPUI_MCP_UPDATE_GOLDENS=1` accepts a change — an
+  environment variable rather than a step parameter, because a script that
+  could update its own golden would never fail; only `1`/`true` count, so a
+  CI `false` does not switch it on.
 
 **On "perceptual tolerance", which this plan asked for and did not get.** Two
 images match when they are the same size and at most `pixel_tolerance` of
@@ -320,7 +328,8 @@ described as one anywhere. It is enough to absorb the level or two that text
 rendering moves between runs on the same machine — a comparison that called
 those a failure would fail every time and teach everyone to ignore it — and
 not enough to miss a layout change. A size mismatch is reported on its own,
-because it has one cause worth naming.
+with nothing counted as differing, and names its cause: an unpinned window,
+or a display with a different scale factor — a golden is in device pixels.
 
 This adds one dependency to the server: `image`, PNG only, no encoders. The
 earlier decision not to take `image` for JPEG screenshots still holds and is a
@@ -333,6 +342,22 @@ then record at 1000x700, resize to 1400x900, replay, and watch the header put
 the window back so the golden matches again. Without the header the same
 replay fails, which is what makes the header load-bearing rather than
 decorative. The CLI exits 1 on the failing run and 0 on the passing one.
+
+Verified again after the review round (2026-08-26), against the story app on
+Windows: a session recorded from one directory writes the golden path relative
+to the script (`..\recording-cwd\golden\main.png`), and a replay started from
+a different directory finds it and compares at 0 differing pixels. A header of
+40x30 is clamped by the platform to 480x320 and stops the run as line 0,
+`failed`, with every step skipped and the counts still adding up.
+`GPUI_MCP_UPDATE_GOLDENS=false` leaves comparison on. A hand-written script
+resolves its golden beside itself and reports the created golden as `passed`
+with the message, and a `replay_script` step is refused with a reason. And one
+finding about the app rather than the tooling: shrinking the story window to
+1000x700 and letting the header grow it back to 1280x800 leaves the sidebar
+some forty pixels wider than before — the resizable panel keeps the width the
+shrink gave it — so the golden fails at 9.4% differing. That is a real drift
+of the starting state, which is what `reset_app` exists for, and the golden
+comparison catching it is the point.
 
 Still not built, and still worth having: recording input a *person* performs by
 hand — the server only sees what passes through it, so that needs the app side.

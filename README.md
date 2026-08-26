@@ -158,7 +158,7 @@ Windows `%APPDATA%\Claude\`):
 | `GPUI_MCP_APP` only | the newest running instance of that app |
 | neither | the newest GPUI app found; a warning on stderr when there is more than one |
 | `GPUI_MCP_RECORD` | additionally: write every successful tool call to this script file — see [Recording and replay](#recording-and-replay) |
-| `GPUI_MCP_UPDATE_GOLDENS` | `1` accepts what the window looks like now instead of failing against the stored golden — a decision for a whole run, after looking at what changed |
+| `GPUI_MCP_UPDATE_GOLDENS` | `1` (or `true`) accepts what the window looks like now instead of failing against the stored golden — a decision for a whole run, after looking at what changed. Any other value, `false` included, leaves comparison on |
 
 Discovery scans the OS temp directory for `gpui-mcp-*.sock`, probes each, and
 deletes the ones nothing listens on (left behind by a crashed app).
@@ -168,7 +168,7 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | tool | what it does |
 |---|---|
 | `gpui_guide` | this server's own documentation — the three-step start, worked examples, how ids resolve, the traps. Answered by the server, so it works before the app runs |
-| `get_windows` | open windows with id, title, bounds, active flag — the window ids the other tools take |
+| `get_windows` | open windows with id, title, bounds, content size, active flag — the window ids the other tools take. `bounds` is the outer frame; `content_size` is what layout sees and what `set_viewport` sets |
 | `ui_snapshot` | the window as one short line per meaningful element — `role "name" #test-id @ref` — with the layout scaffolding dropped. Start here: on a real UI it is a fraction of the tree's size |
 | `get_app_state` | window overview plus whatever the app's state provider returns (`app` key) |
 | `a11y_audit` | controls nothing can name, ids that name several elements, targets under 24px — the problems that hurt a screen-reader user and a script equally |
@@ -190,10 +190,12 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `reset_app` | put the app back into a known starting state via the hook it registered. Fails loudly when there is none |
 | `expect_screenshot` | compare the window against a stored golden image. Answered by the server, so the goldens live beside the script |
 
-Every input tool (`send_key`, `type_text`, `click_element`, `execute_action`)
-waits for the frame that shows what it changed, then appends the app state and
-focus info from *that* frame, so the answer describes the app after the input
-rather than the app it replaced. `settled: false` in an answer means no frame
+Every input tool (`send_key`, `type_text`, `click_element`, `execute_action`,
+and `reset_app`, which is input by another name) waits for the frame that shows
+what it changed, then appends the app state and focus info from *that* frame,
+so the answer describes the app after the input rather than the app it
+replaced. `set_viewport` waits for that frame too, and answers with the size
+actually reached. `settled: false` in an answer means no frame
 was painted while it waited — a minimised or occluded window — and everything
 in that answer describes an older frame.
 
@@ -417,11 +419,16 @@ unsatisfied **is** a failed assertion, and it already reports which condition
 did not hold.
 
 ```
+  0  applied  viewport 1280x800
   1  passed   click_element
   2  failed   wait_for — waited 310 ms and the condition never held: {"text":{"found":false,"query":"Saved"}}
 
 open-file: 1 passed, 1 failed, 0 skipped, of 4
 ```
+
+Line 0 is the script's viewport header, applied before the first step. When it
+cannot be — no window, or a window that refused the size — the run stops
+there, every step reads `skipped`, and line 0 says why.
 Which makes the CLI form the interesting one: the file an agent produced by
 exploring runs in CI afterwards, with no agent and no model cost.
 
@@ -440,9 +447,11 @@ the first step:
 ```
 
 The recorder asks the app for it once, so this is filled in whether or not the
-session ever looked at a window. A window that cannot be resized aborts the
-replay rather than producing a run of failures that all describe the wrong
-problem.
+session ever looked at a window. It is the *content* size — what layout sees —
+not the outer frame, which on macOS includes the title bar. A window that
+cannot be resized, or that comes back a different size than it was asked for
+(`honoured: false` — a platform minimum, a maximised window), aborts the replay
+rather than producing a run of failures that all describe the wrong problem.
 
 **The starting state.** Nothing here can make an app left on the third tab with
 two files open behave like one that just started — only the app can. Register
@@ -464,22 +473,37 @@ a bug.
 stored image:
 
 ```json
-{ "method": "expect_screenshot", "params": { "path": "tests/golden/sidebar.png" } }
+{ "method": "expect_screenshot", "params": { "path": "golden/sidebar.png" } }
 ```
 
+In a script the path is relative to the script file, so the goldens travel
+with it and resolve the same from whichever directory the replay is started.
+The recorder writes it that way: an agent names the golden relative to
+wherever the MCP client started the server, and that directory is written down
+nowhere. (Called directly as a tool, the path is relative to the server's
+working directory.)
+
 The first run writes the golden and says there was nothing to compare against —
-look at it before trusting the next run. Later runs compare, and a failure
-writes this run beside the golden as `<name>.actual.png` so both can be opened.
-Two images match when they are the same size and at most `pixel_tolerance` of
-pixels (default 0.1%) differ by more than `channel_tolerance` per channel
-(default 8). That is not a perceptual metric and is not claimed to be — it is
-enough to absorb the level or two that text rendering moves between runs, and
-not enough to miss a layout change. A size mismatch is reported on its own,
-because it has one cause worth naming: the window was not pinned.
+look at it before trusting the next run. The step passes, and the replay
+report and the CLI line carry that message rather than a bare `passed`. Later
+runs compare, and a failure writes this run beside the golden as
+`<name>.actual.png` so both can be opened. Two images match when they are the
+same size and at most `pixel_tolerance` of pixels (default 0.1%) differ by
+more than `channel_tolerance` per channel (default 8). That is not a
+perceptual metric and is not claimed to be — it is enough to absorb the level
+or two that text rendering moves between runs, and not enough to miss a
+layout change.
+
+A size mismatch is reported on its own, with nothing counted as differing, and
+names its likely cause: the window was not pinned, or — when both sides differ
+by the same factor — the display has a different scale factor than the one
+the golden was taken on. A golden is in device pixels, so a 1280x800 window is
+a 1920x1200 image at 150%.
 
 `GPUI_MCP_UPDATE_GOLDENS=1` rewrites goldens instead of failing. It is an
 environment variable rather than a step parameter on purpose — a script that
-could update its own golden would never fail.
+could update its own golden would never fail. Only `1` (or `true`) switches it
+on: a CI file that exports a YAML `false` as the string `"false"` must not.
 
 ## Platform notes
 

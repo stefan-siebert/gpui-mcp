@@ -66,11 +66,19 @@ MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJS
   exists — and a row in the tool table of gpui-component's `docs/docs/mcp.md`
   (plus its `zh-CN` mirror, which that repo requires).
 - Docs and code comments in English.
-- `wait_for` and `batch` are answered asynchronously by the app (it waits for
-  frames); every other method is answered from the frame already painted. Input
-  methods answer only after the frame showing their effect — that is protocol
-  v2, and it is why the version was bumped despite the types staying
-  compatible.
+- `wait_for`, `batch`, `a11y_tree` and `set_viewport` are answered
+  asynchronously by the app (it waits for frames); every other method is
+  answered from the frame already painted. Input methods (`click_element`,
+  `send_key`, `type_text`, `execute_action`, `reset_app`) answer only after the
+  frame showing their effect, with `app_state` and `focus_info` from that frame
+  appended — that is protocol v2, and it is why the version was bumped despite
+  the types staying compatible.
+- Window sizes: `WindowInfo.bounds` is the outer frame (on macOS including the
+  title bar); `content_size` is what layout sees and what `set_viewport` sets
+  and measures. A recorded script's `viewport` is the content size.
+- In a script, a golden's `path` is relative to the script file, not to the
+  working directory: the recorder writes it that way and replay resolves it
+  that way. Called directly as a tool it is relative to the server's cwd.
 
 ## Commands
 

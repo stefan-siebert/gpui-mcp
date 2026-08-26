@@ -415,8 +415,23 @@ layout — a sidebar collapses, a toolbar folds into a menu, and the element a
 step wanted is somewhere else or nowhere. So a script carries a `viewport`
 header and `replay` applies it before the first step, and the recorder asks the
 app for the size once so the header exists whether or not the session ever
-looked at a window. A resize that fails aborts the run instead of letting every
-later step fail for a reason none of them names.
+looked at a window. Once, literally: the probe is a discovery plus a round
+trip, and a session against an app with no window yet would otherwise pay it
+on every step.
+
+The size is the *content* size. `get_windows` reports both `bounds` — the
+outer frame, which on macOS includes the title bar — and `content_size`, which
+is what layout sees and what `set_viewport` sets. Recording the frame would
+have made every honest replay on a Mac resize the content to the frame's size
+and then be told the resize was refused.
+
+A resize that fails aborts the run, and so does one the platform refused: the
+app answers a clamped or ignored resize with `Ok` and `honoured: false`, and
+replay treats that as the abort it is, rather than carrying on against a
+layout the script never meant. The header is reported on its own, as line 0
+of the CLI output, and is not counted among the steps — so `passed + failed
++ skipped` is always `of`, and a run that stopped at the header is `ok: false`
+with `failed: 0` and every step skipped, with the reason in `viewport.detail`.
 
 **The starting state is the app's to define.** Nothing on this side can make an
 app left on the third tab with two files open behave like one that just
@@ -434,6 +449,15 @@ JPEG screenshots; that was a different question with a different answer,
 because an image costs tokens by its dimensions and the encoding bought
 nothing. Comparing pixels cannot be done without decoding them.
 
+**"Beside the script" is a path rule, not a hope.** In a script, a golden's
+`path` is relative to the script file. The recorder writes it that way — the
+agent named it relative to the server's working directory, which is whatever
+the MCP client chose and appears in no file — and replay resolves it that way.
+Before this, a replay started from any directory other than the recording one
+found no golden, wrote a fresh one, and passed: a green run that compared
+nothing. That case is also why a created golden passes *with a message* the
+CLI prints, rather than as a bare `passed`.
+
 **Two numbers, and neither is called perceptual.** Images match when they are
 the same size and at most `pixel_tolerance` of pixels differ by more than
 `channel_tolerance` per channel. Text rendering, subpixel positioning and GPU
@@ -446,11 +470,24 @@ cheaper than pretending otherwise and being believed.
 
 **A failure leaves evidence.** The new image is written beside the golden as
 `<name>.actual.png`. A failure that reports only a percentage cannot be acted
-on; two files can be opened side by side. And a size mismatch is reported on
-its own rather than as "100% of pixels differ", because it has exactly one
-cause worth naming: the window was not pinned.
+on; two files can be opened side by side.
+
+**A size mismatch is its own kind of failure**, reported with `compared:
+false` and nothing counted as differing — "100% of pixels differ" would be a
+claim about a comparison that never happened. Its causes are few enough to
+name, and the message does: the window was not pinned, or the display has a
+different scale factor. The second one exists because a screenshot is in
+device pixels while a viewport is logical, so the same pinned 1280x800 window
+is a 1920x1200 image on a 150% display. That case is recognisable — both sides
+differ by the same factor — and the app reports the `scale_factor` it rendered
+at, so the message can say which it was rather than sending everyone to pin a
+window that was pinned. A cropped element has a third cause, itself, and the
+message says so when `element_id` was set.
 
 **Updating goldens is an environment variable, not a parameter.** A script that
 could ask for its own golden to be rewritten would never fail. Accepting a new
 appearance is a decision a person makes for a whole run, after looking at what
-changed.
+changed. Only `1` (and `true`, `yes`, `on`) switches it on. The first cut
+treated every non-empty value but `0` as on, which meant a CI file exporting a
+YAML boolean as the string `"false"` rewrote every golden and went green — the
+exact run this switch exists to prevent.
