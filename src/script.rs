@@ -1461,7 +1461,10 @@ mod tests {
         );
 
         if recorded.is_relative() {
-            let script_dir = path.parent().unwrap();
+            // The spelling the recorder anchored on: on macOS the temp
+            // directory is reached through a symlink (`/var` is
+            // `/private/var`), and the relative path climbs from the real one.
+            let script_dir = std::fs::canonicalize(path.parent().unwrap()).unwrap();
             assert_eq!(normalise(&script_dir.join(&recorded)), meant);
         } else {
             // The temp directory and the working directory are on different
