@@ -154,13 +154,14 @@ Windows `%APPDATA%\Claude\`):
 
 | environment | behaviour |
 |---|---|
-| `GPUI_MCP_APP` + `GPUI_MCP_PID` | exactly `{temp_dir}/gpui-mcp-{app}-{pid}.sock`, no discovery |
+| `GPUI_MCP_APP` + `GPUI_MCP_PID` | exactly `{socket_dir}/gpui-mcp-{app}-{pid}.sock`, no discovery |
 | `GPUI_MCP_APP` only | the newest running instance of that app |
+| `GPUI_MCP_SOCKET_DIR` | look for sockets in this directory instead of the OS temp directory. For a sandboxed app, which can only create its socket inside its container (`~/Library/Containers/<bundle id>/Data/tmp` on macOS). Combines with both rows above |
 | neither | the newest GPUI app found; a warning on stderr when there is more than one |
 | `GPUI_MCP_RECORD` | additionally: write every successful tool call to this script file — see [Recording and replay](#recording-and-replay) |
 | `GPUI_MCP_UPDATE_GOLDENS` | `1` (or `true`) accepts what the window looks like now instead of failing against the stored golden — a decision for a whole run, after looking at what changed. Any other value, `false` included, leaves comparison on |
 
-Discovery scans the OS temp directory for `gpui-mcp-*.sock`, probes each, and
+Discovery scans the OS temp directory (or `GPUI_MCP_SOCKET_DIR`) for `gpui-mcp-*.sock`, probes each, and
 deletes the ones nothing listens on (left behind by a crashed app).
 
 ## The tools

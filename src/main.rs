@@ -54,13 +54,30 @@ fn parse_socket_name(name: &str) -> Option<(String, u32)> {
     Some((app.to_string(), pid))
 }
 
-/// Discover running GPUI MCP instances by scanning `temp_dir` for sockets.
+/// Where app sockets live: `GPUI_MCP_SOCKET_DIR` when set, the temp directory
+/// otherwise.
+///
+/// An app that runs in a sandbox cannot create a socket where this process
+/// looks by default. The App Store edition of Elane can write only inside its
+/// container, so its socket is `~/Library/Containers/<bundle id>/Data/tmp/…`,
+/// and nothing about that path can be guessed from outside: the bundle id is
+/// the app's own. Pointing this server at the directory is the one piece of
+/// configuration that costs nothing on the app side. An empty value counts as
+/// unset, so a launcher that expands a missing variable to "" still works.
+fn socket_dir() -> std::path::PathBuf {
+    std::env::var_os("GPUI_MCP_SOCKET_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Discover running GPUI MCP instances by scanning [`socket_dir`] for sockets.
 ///
 /// If `app_filter` is `Some`, only instances with that app name are returned.
 /// The list is sorted by mtime, newest first. Stale (non-connectable) sockets
 /// are removed as a side effect.
 fn discover_instances(app_filter: Option<&str>) -> Vec<Instance> {
-    let temp_dir = std::env::temp_dir();
+    let temp_dir = socket_dir();
     let mut instances = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(&temp_dir) else {
@@ -117,7 +134,7 @@ fn resolve_socket_path() -> Result<String> {
     let pid = std::env::var("GPUI_MCP_PID").ok();
 
     if let (Some(app), Some(pid)) = (app.as_deref(), pid.as_deref()) {
-        let path = std::env::temp_dir()
+        let path = socket_dir()
             .join(format!("gpui-mcp-{}-{}.sock", app, pid))
             .to_string_lossy()
             .into_owned();
@@ -142,7 +159,7 @@ fn resolve_socket_path() -> Result<String> {
             Err(anyhow::anyhow!(
                 "No running GPUI app found{}. Scanned: {}",
                 scope,
-                std::env::temp_dir().display()
+                socket_dir().display()
             ))
         }
         1 => Ok(instances.into_iter().next().unwrap().path),
@@ -1165,6 +1182,8 @@ gpui-mcp-server — an MCP server for inspecting and driving a running GPUI app.
 Environment:
   GPUI_MCP_APP             restrict discovery to one app name
   GPUI_MCP_PID             with GPUI_MCP_APP: one exact instance, no discovery
+  GPUI_MCP_SOCKET_DIR      look for app sockets here instead of the temp
+                           directory (a sandboxed app's container tmp/)
   GPUI_MCP_RECORD          write every successful tool call to this script file
   GPUI_MCP_UPDATE_GOLDENS  1: rewrite golden images instead of failing against them
 ";
