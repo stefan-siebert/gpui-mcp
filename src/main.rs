@@ -54,36 +54,56 @@ fn parse_socket_name(name: &str) -> Option<(String, u32)> {
     Some((app.to_string(), pid))
 }
 
-/// Where app sockets live: `GPUI_MCP_SOCKET_DIR` when set, the temp directory
-/// otherwise.
+/// Where a sandboxed macOS app puts its socket, relative to the home
+/// directory. Must equal `SANDBOX_SOCKET_DIR` in gpui-component's `mcp.rs`.
+const SANDBOX_SOCKET_DIR: &str = "Library/Caches/gpui-mcp";
+
+/// Where app sockets live: `GPUI_MCP_SOCKET_DIR` alone when set; otherwise
+/// the temp directory and, on macOS, [`SANDBOX_SOCKET_DIR`].
 ///
-/// An app that runs in a sandbox cannot create a socket where this process
-/// looks by default. The App Store edition of Elane can write only inside its
-/// container, so its socket is `~/Library/Containers/<bundle id>/Data/tmp/…`,
-/// and nothing about that path can be guessed from outside: the bundle id is
-/// the app's own. Pointing this server at the directory is the one piece of
-/// configuration that costs nothing on the app side. An empty value counts as
-/// unset, so a launcher that expands a missing variable to "" still works.
-fn socket_dir() -> std::path::PathBuf {
-    std::env::var_os("GPUI_MCP_SOCKET_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+/// An app that runs in the macOS sandbox cannot create a socket in the temp
+/// directory this process sees — its own lies in its container,
+/// `~/Library/Containers/<bundle id>/Data/tmp/`. Pointing this server there
+/// is rarely enough: macOS closes an app's container to every other app, and
+/// a server started from a terminal without Full Disk Access gets "Operation
+/// not permitted" (measured 2026-10-05). So a sandboxed development build
+/// binds in `~/Library/Caches/gpui-mcp/` instead, which its bundle is
+/// entitled to and nothing protects from this process, and that directory is
+/// scanned by default. An empty variable counts as unset, so a launcher that
+/// expands a missing one to "" still works.
+fn socket_dirs() -> Vec<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("GPUI_MCP_SOCKET_DIR").filter(|dir| !dir.is_empty()) {
+        return vec![std::path::PathBuf::from(dir)];
+    }
+    let mut dirs = vec![std::env::temp_dir()];
+    if cfg!(target_os = "macos") {
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            dirs.push(std::path::Path::new(&home).join(SANDBOX_SOCKET_DIR));
+        }
+    }
+    dirs
 }
 
-/// Discover running GPUI MCP instances by scanning [`socket_dir`] for sockets.
+fn scanned() -> String {
+    socket_dirs()
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Discover running GPUI MCP instances by scanning [`socket_dirs`] for sockets.
 ///
 /// If `app_filter` is `Some`, only instances with that app name are returned.
 /// The list is sorted by mtime, newest first. Stale (non-connectable) sockets
 /// are removed as a side effect.
 fn discover_instances(app_filter: Option<&str>) -> Vec<Instance> {
-    let temp_dir = socket_dir();
     let mut instances = Vec::new();
 
-    let Ok(entries) = std::fs::read_dir(&temp_dir) else {
-        return instances;
-    };
-
+    let entries = socket_dirs()
+        .into_iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -134,10 +154,18 @@ fn resolve_socket_path() -> Result<String> {
     let pid = std::env::var("GPUI_MCP_PID").ok();
 
     if let (Some(app), Some(pid)) = (app.as_deref(), pid.as_deref()) {
-        let path = socket_dir()
-            .join(format!("gpui-mcp-{}-{}.sock", app, pid))
-            .to_string_lossy()
-            .into_owned();
+        let name = format!("gpui-mcp-{}-{}.sock", app, pid);
+        let candidates: Vec<_> = socket_dirs()
+            .into_iter()
+            .map(|dir| dir.join(&name))
+            .collect();
+        // The one that exists; the first, for the error message, if none does.
+        let path = candidates
+            .iter()
+            .find(|path| path.exists())
+            .or(candidates.first())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or(name);
         return Ok(path);
     }
 
@@ -159,7 +187,7 @@ fn resolve_socket_path() -> Result<String> {
             Err(anyhow::anyhow!(
                 "No running GPUI app found{}. Scanned: {}",
                 scope,
-                socket_dir().display()
+                scanned()
             ))
         }
         1 => Ok(instances.into_iter().next().unwrap().path),
