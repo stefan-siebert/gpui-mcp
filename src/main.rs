@@ -1,3 +1,7 @@
+// The tool list is one `json!` literal, and the macro recurses once per
+// token of it: with `drag` and `scroll` it passed the default limit of 128.
+#![recursion_limit = "256"]
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -985,6 +989,64 @@ fn tools_list() -> serde_json::Value {
                             "type": "string",
                             "description": "Target window (default: active window)"
                         }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "drag",
+                "description": "Press the mouse, move it in steps, release it: drag a handle, resize by a grip, select text. Each step is painted before the next, so an app that reacts to the press by rendering a drag layer sees the moves. START: element_id (its centre, or offset_x/offset_y from its top left corner) or x/y. END: to_element_id, or to_x/to_y, or dx/dy from the start; with no end the mouse is pressed and released in place, which with click_count 2 is a double click. The answer carries selected_text when the window has a text selection afterwards, and selected_text_before_release for what was marked while the button was still down. Example: {\"element_id\": \"dialog-header\", \"dx\": 120, \"dy\": 40}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "element_id": { "type": "string", "description": "Start on this element. Supports full_id, global_id, suffix match, or a @ref." },
+                        "x": { "type": "number", "description": "Start X in window pixels, when element_id is not given." },
+                        "y": { "type": "number", "description": "Start Y in window pixels, when element_id is not given." },
+                        "offset_x": { "type": "number", "description": "Start this far right of the element's left edge instead of at its centre." },
+                        "offset_y": { "type": "number", "description": "Start this far below the element's top edge instead of at its centre." },
+                        "to_element_id": { "type": "string", "description": "Release on the centre of this element." },
+                        "to_x": { "type": "number", "description": "Release at this window X. Omitted: the start's X." },
+                        "to_y": { "type": "number", "description": "Release at this window Y. Omitted: the start's Y." },
+                        "dx": { "type": "number", "description": "Release this far right of the start (negative: left)." },
+                        "dy": { "type": "number", "description": "Release this far below the start (negative: above)." },
+                        "steps": { "type": "integer", "description": "Mouse-move events between press and release, one frame each. Default 8, at most 64." },
+                        "click_count": { "type": "integer", "description": "Click count of the press and release. 2 is a double click. Default 1." },
+                        "button": { "type": "string", "enum": ["Left", "Right", "Middle"], "description": "Mouse button (default: Left)" },
+                        "modifiers": {
+                            "type": "object",
+                            "properties": {
+                                "ctrl": { "type": "boolean", "description": "Control modifier" },
+                                "alt": { "type": "boolean", "description": "Alt modifier" },
+                                "shift": { "type": "boolean", "description": "Shift modifier" },
+                                "meta": { "type": "boolean", "description": "Super/Cmd modifier" }
+                            }
+                        },
+                        "window_id": { "type": "string", "description": "Target window (default: active window)" }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "scroll",
+                "description": "Turn the mouse wheel over an element (its centre) or at x/y. dy is in pixels and positive towards the end of the content, as a wheel turned down scrolls; dx likewise to the right. Example: {\"element_id\": \"results\", \"dy\": 200}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "element_id": { "type": "string", "description": "Scroll over the centre of this element. Supports full_id, global_id, suffix match, or a @ref." },
+                        "x": { "type": "number", "description": "Window X, when element_id is not given." },
+                        "y": { "type": "number", "description": "Window Y, when element_id is not given." },
+                        "dx": { "type": "number", "description": "Pixels to scroll horizontally; positive is right. Default 0." },
+                        "dy": { "type": "number", "description": "Pixels to scroll vertically; positive is down. Default 0." },
+                        "modifiers": {
+                            "type": "object",
+                            "properties": {
+                                "ctrl": { "type": "boolean", "description": "Control modifier" },
+                                "alt": { "type": "boolean", "description": "Alt modifier" },
+                                "shift": { "type": "boolean", "description": "Shift modifier" },
+                                "meta": { "type": "boolean", "description": "Super/Cmd modifier" }
+                            }
+                        },
+                        "window_id": { "type": "string", "description": "Target window (default: active window)" }
                     },
                     "required": []
                 }

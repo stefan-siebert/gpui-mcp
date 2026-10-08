@@ -332,7 +332,26 @@ the answer's `dispatched` count tells you how many arrived.
 Clicks the centre of the element, or the given window coordinates. Optional
 `button: "Left" | "Right" | "Middle"`.
 
-All four driving tools append `app_state` and `focus_info` to their answer —
+**`drag`** — `{"element_id": "dialog-header", "dx": 120, "dy": 40}`
+Presses the mouse, moves it in `steps` (default 8), releases it. Every step is
+painted before the next one is sent — an app that answers the press by
+rendering a drag layer, a selection or a resize capture gets its moves, which
+events sent in one go would not. Start: `element_id` (its centre, or
+`offset_x`/`offset_y` from its top left corner) or `x`/`y`. End:
+`to_element_id`, or `to_x`/`to_y`, or `dx`/`dy` from the start. With no end
+the mouse is pressed and released in place, so `click_count: 2` is a double
+click. Optional `button`, `modifiers`. When the window has a text selection
+the answer says what it is: `selected_text` after the release, and
+`selected_text_before_release` for what was marked while the button was still
+down — the pair is how a selection that the release throws away shows up.
+`get_focus_info` reports the same as `text_selection`.
+
+**`scroll`** — `{"element_id": "results", "dy": 200}`
+One mouse-wheel event over the centre of the element, or at `x`/`y`. `dy` is
+in pixels and positive towards the end of the content, the way a wheel turned
+down scrolls; `dx` likewise to the right.
+
+All six driving tools append `app_state` and `focus_info` to their answer —
 see the staleness note in the `overview` topic.
 
 ## State

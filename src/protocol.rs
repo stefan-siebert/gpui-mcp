@@ -221,6 +221,72 @@ pub struct ClickEvent {
     pub button: MouseButton,
 }
 
+/// Params for [`methods::DRAG`]: press at a start, move in steps, release at
+/// an end.
+///
+/// The start is `element_id` (its centre, or `offset_x`/`offset_y` from its
+/// top left corner) or `x`/`y`. The end is `to_element_id`, or `to_x`/`to_y`,
+/// or `dx`/`dy` from the start; with none of them the mouse is pressed and
+/// released in place, which with `click_count: 2` is a double click.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DragEvent {
+    #[serde(default)]
+    pub element_id: Option<String>,
+    #[serde(default)]
+    pub x: f32,
+    #[serde(default)]
+    pub y: f32,
+    #[serde(default)]
+    pub offset_x: Option<f32>,
+    #[serde(default)]
+    pub offset_y: Option<f32>,
+    #[serde(default)]
+    pub to_element_id: Option<String>,
+    #[serde(default)]
+    pub to_x: Option<f32>,
+    #[serde(default)]
+    pub to_y: Option<f32>,
+    #[serde(default)]
+    pub dx: Option<f32>,
+    #[serde(default)]
+    pub dy: Option<f32>,
+    /// How many mouse-move events lie between press and release, each on a
+    /// frame of its own. Default 8.
+    #[serde(default)]
+    pub steps: Option<u32>,
+    /// Click count of the press and the release. Default 1.
+    #[serde(default)]
+    pub click_count: Option<usize>,
+    #[serde(default)]
+    pub button: MouseButton,
+    #[serde(default)]
+    pub modifiers: Modifiers,
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
+
+/// Params for [`methods::SCROLL`]: one wheel event over `element_id` (its
+/// centre) or at `x`/`y`. `dy` is in pixels and positive towards the end of
+/// the content, the way a wheel turned down scrolls; `dx` likewise to the
+/// right.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScrollEvent {
+    #[serde(default)]
+    pub element_id: Option<String>,
+    #[serde(default)]
+    pub x: f32,
+    #[serde(default)]
+    pub y: f32,
+    #[serde(default)]
+    pub dx: f32,
+    #[serde(default)]
+    pub dy: f32,
+    #[serde(default)]
+    pub modifiers: Modifiers,
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseButton {
     #[default]
@@ -269,6 +335,8 @@ pub mod methods {
     pub const WAIT_FOR: &str = "wait_for";
     pub const BATCH: &str = "batch";
     pub const CLICK_ELEMENT: &str = "click_element";
+    pub const DRAG: &str = "drag";
+    pub const SCROLL: &str = "scroll";
     pub const SEND_KEY: &str = "send_key";
     pub const TYPE_TEXT: &str = "type_text";
     pub const EXECUTE_ACTION: &str = "execute_action";
@@ -295,6 +363,8 @@ pub mod methods {
         EXECUTE_ACTION,
         SEND_KEY,
         CLICK_ELEMENT,
+        DRAG,
+        SCROLL,
         TYPE_TEXT,
         WAIT_FOR,
         BATCH,
