@@ -322,6 +322,11 @@ Optional `args` for the few actions that take them.
 GPUI key notation: lowercase names — `a`-`z`, `0`-`9`, `enter`, `escape`,
 `tab`, `space`, `backspace`, `delete`, `up`, `down`, `left`, `right`, `home`,
 `end`, `pageup`, `pagedown`, `f1`-`f12`.
+`"repeat": {"count": 10}` holds the key: ten auto-repeats follow the press,
+the first after `delay_ms` (500), then `interval_ms` (33) apart, as a
+keyboard sends them — for what only a held key shows, such as a toggle that
+flickers. An app that cannot deliver repeats
+refuses the call instead of pressing once.
 
 **`type_text`** — `{"text": "src/main.rs"}`
 One keystroke per character into the focused element; space, newline and tab

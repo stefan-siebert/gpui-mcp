@@ -179,7 +179,7 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `get_focus_info` | the focus handle and the active key-context chain — the first thing to check when a key binding does not fire |
 | `list_actions` | the app's gpui actions; `include_bindings` adds key bindings and docs, `only_available` keeps those whose context predicate matches the current focus |
 | `execute_action` | dispatch a named action through the focus chain, as a keystroke would |
-| `send_key` | one keystroke in gpui's notation (`enter`, `pagedown`, `f5`; modifiers as flags) |
+| `send_key` | one keystroke in gpui's notation (`enter`, `pagedown`, `f5`; modifiers as flags); `repeat: {count, interval_ms, delay_ms}` holds it |
 | `type_text` | a string, one keystroke per character |
 | `click_element` | left/right/middle click at an element's centre or at window pixel coordinates |
 | `wait_for` | wait inside the app, one check per painted frame, until an element, a text, a key context or an app-state value is there — or, with `absent`, gone |

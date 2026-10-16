@@ -305,7 +305,37 @@ pub struct KeyEvent {
     /// Target window (falls back to the active window, then the first window).
     #[serde(default)]
     pub window_id: Option<String>,
+    /// Hold the key instead of tapping it: after the press, [`KeyRepeat::count`]
+    /// more arrive the way the platform's auto-repeat delivers them. Absent
+    /// means one press. An app side that cannot deliver repeats refuses the
+    /// request rather than sending a single press in their place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<KeyRepeat>,
 }
+
+/// How a held key repeats, for [`KeyEvent::repeat`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRepeat {
+    /// Repeats after the initial press, at most [`MAX_KEY_REPEATS`].
+    pub count: u32,
+    /// Time between two repeats; [`DEFAULT_REPEAT_INTERVAL_MS`] when absent.
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
+    /// Time from the press to the first repeat; [`DEFAULT_REPEAT_DELAY_MS`]
+    /// when absent. Not a detail: where an app has to infer repeats from
+    /// timing, it is this pause that makes the press read as a press.
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+}
+
+/// A typical auto-repeat rate (GNOME's default is 30 ms, macOS's ~33 ms).
+pub const DEFAULT_REPEAT_INTERVAL_MS: u64 = 33;
+
+/// A typical delay before the first repeat (GNOME's default is 500 ms).
+pub const DEFAULT_REPEAT_DELAY_MS: u64 = 500;
+
+/// Upper bound for [`KeyRepeat::count`]: a few seconds of holding.
+pub const MAX_KEY_REPEATS: u32 = 100;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Modifiers {

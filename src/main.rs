@@ -963,6 +963,16 @@ fn tools_list() -> serde_json::Value {
                         "window_id": {
                             "type": "string",
                             "description": "Target window (default: active window)"
+                        },
+                        "repeat": {
+                            "type": "object",
+                            "description": "Hold the key instead of tapping it: after the press and a pause of `delay_ms` (default 500), `count` more arrive the way the platform's auto-repeat delivers them, `interval_ms` apart (default 33). For bugs that only a held key shows, such as a toggle flickering. An app side that cannot deliver repeats refuses the request. Example: {\"key\": \"escape\", \"repeat\": {\"count\": 10}}",
+                            "properties": {
+                                "count": { "type": "integer", "description": "Repeats after the press, at most 100" },
+                                "interval_ms": { "type": "integer", "description": "Time between two repeats (default 33)" },
+                                "delay_ms": { "type": "integer", "description": "Time from the press to the first repeat (default 500)" }
+                            },
+                            "required": ["count"]
                         }
                     },
                     "required": ["key"]
