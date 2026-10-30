@@ -656,6 +656,13 @@ pub struct WaitForParams {
     /// The value [`Self::app_state_path`] must reach.
     #[serde(default)]
     pub app_state_equals: Option<serde_json::Value>,
+    /// The value [`Self::app_state_path`] must move away from — the one read
+    /// before the action whose effect is awaited. Unlike "wait for a change
+    /// from the start of this wait", it cannot miss a change that landed
+    /// between the action and the wait. E.g. after an edit under hot
+    /// reloading: `/gpui/hot_reload/patches_received` ≠ the count before.
+    #[serde(default)]
+    pub app_state_not_equals: Option<serde_json::Value>,
     /// Invert the whole predicate: wait until the conditions stop holding.
     /// This is how you wait for a dialog to close or a spinner to go away.
     #[serde(default)]
@@ -842,7 +849,7 @@ mod tests {
     fn wait_for_reads_a_full_condition() {
         let params: WaitForParams = serde_json::from_str(
             r#"{"element_id":"results","text":"Done","absent":true,"timeout_ms":500,"key_context":"Dialog",
-                "app_state_path":"/app/rows","app_state_equals":12}"#,
+                "app_state_path":"/app/rows","app_state_equals":12,"app_state_not_equals":11}"#,
         )
         .unwrap();
         assert_eq!(params.element_id.as_deref(), Some("results"));
@@ -852,6 +859,7 @@ mod tests {
         assert_eq!(params.timeout_ms, Some(500));
         assert_eq!(params.app_state_path.as_deref(), Some("/app/rows"));
         assert_eq!(params.app_state_equals, Some(serde_json::json!(12)));
+        assert_eq!(params.app_state_not_equals, Some(serde_json::json!(11)));
     }
 
     /// Continuing past a failed step is the dangerous default, so it must be

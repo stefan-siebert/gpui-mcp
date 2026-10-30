@@ -1104,6 +1104,9 @@ fn tools_list() -> serde_json::Value {
                         "app_state_equals": {
                             "description": "The value app_state_path must reach."
                         },
+                        "app_state_not_equals": {
+                            "description": "The value app_state_path must move away from: the one you read before the action you are waiting on, so a change that landed before the wait started still counts. After an edit under hot reloading: app_state_path '/gpui/hot_reload/patches_received', app_state_not_equals = the count read before the edit; then read /gpui/hot_reload for whether it applied."
+                        },
                         "absent": {
                             "type": "boolean",
                             "description": "Invert: wait until the conditions stop holding. Default: false."

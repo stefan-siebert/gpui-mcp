@@ -293,8 +293,10 @@ are no longer window coordinates.
 Waits inside the app, checking once per painted frame, until every condition
 given holds at once. Conditions: `element_id` (an element is painted), `text`
 (painted anywhere in the window), `key_context` (a context is on the focus
-chain), `app_state_path` + optional `app_state_equals` (a JSON pointer into
-`get_app_state`). `absent: true` inverts the lot — that is how you wait for a
+chain), `app_state_path` + optional `app_state_equals` or
+`app_state_not_equals` (a JSON pointer into `get_app_state`; `not_equals`
+takes the value read *before* the action, so a change that landed before the
+wait began still counts). `absent: true` inverts the lot — that is how you wait for a
 dialog to close. `timeout_ms` defaults to 3000 and is capped at 30000.
 Running out of time is not an error: the answer says `satisfied: false` and
 `checks` names the part that was missing.
@@ -559,6 +561,19 @@ know is a load, a debounce or an animation the app started for itself:
 
 Waiting happens inside the app, one check per painted frame. Calling a read
 tool in a loop to achieve the same thing costs a model turn per look.
+
+## Wait for a hot patch to land
+
+An app served by `dx serve --hot-patch` reports its hot-reload client under
+`/gpui/hot_reload` (`null` in a build without hot reloading). Read
+`patches_received` before the edit, save, then wait for it to move:
+
+```json
+{"name": "wait_for", "arguments": {"app_state_path": "/gpui/hot_reload/patches_received", "app_state_not_equals": 3, "timeout_ms": 30000}}
+```
+
+Then `/gpui/hot_reload/last_error` says whether it applied. A compile error
+never reaches the app — no patch arrives, and the wait runs out.
 
 ## Wait for a dialog to close
 
