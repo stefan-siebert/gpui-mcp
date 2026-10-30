@@ -364,8 +364,9 @@ see the staleness note in the `overview` topic.
 ## State
 
 **`get_app_state`** — `{}`
-`{window_count, active_window, windows}`, plus an `app` key holding whatever
-the application's own state provider returns. If the app registered one, this
+`{window_count, active_window, windows, gpui}`, plus an `app` key holding
+whatever the application's own state provider returns. `gpui.hot_reload` is
+the hot-reload client (`null` without it). If the app registered one, this
 is the cheapest ground truth available — much cheaper than a tree or an image.
 
 **`get_logs`** — `{}`
@@ -439,6 +440,21 @@ calls belongs in one `batch`:
 One turn instead of five, and the screenshot comes back attached to the same
 answer. Steps stop at the first failure, so a batch that reports `ok: true` did
 the whole thing.
+
+## Start the app, or start it again
+
+```json
+{"name": "launch_app", "arguments": {"profile": "hot"}}
+```
+
+Runs a command configured for this server (`GPUI_MCP_LAUNCH`, never one from
+the call), stops any running instance first, and answers when a *new*
+instance answers: `ready: true` and its pid. A build that fails comes back as
+an error with the end of its log — also from a dev server that keeps running
+after a failed build (`dx`'s `Build failed`). `ready: false` means the wait
+ran out with nothing wrong: call it again to go on waiting for the same
+launch. `stop_app` ends the app and the command. Neither is meant for an
+allowlist: starting a process stays the user's decision.
 
 ## Verify a UI change you just made
 

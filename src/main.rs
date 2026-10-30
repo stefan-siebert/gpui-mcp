@@ -17,6 +17,7 @@ use gpui_mcp_protocol::protocol::*;
 
 mod docs;
 mod golden;
+mod launch;
 mod script;
 
 use golden::TOOL_NAME as GOLDEN_TOOL;
@@ -265,6 +266,40 @@ fn take_handoff(shot: &ScreenshotResult) -> std::io::Result<Vec<u8>> {
     let bytes = std::fs::read(&shot.path)?;
     let _ = std::fs::remove_file(&shot.path);
     Ok(bytes)
+}
+
+/// The instances of the configured app (`GPUI_MCP_APP`, or any), as
+/// `(pid, socket)` — what [`launch::Launcher`] watches.
+fn app_instances() -> Vec<(u32, String)> {
+    let app = std::env::var("GPUI_MCP_APP").ok();
+    discover_instances(app.as_deref())
+        .into_iter()
+        .map(|instance| (instance.pid, instance.path))
+        .collect()
+}
+
+/// Whether the app behind `socket` answers a request — a socket can exist a
+/// moment before the app serves it.
+fn answers_at(socket: &str) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let request = IpcRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        methods::GET_WINDOWS.to_string(),
+        json!({}),
+    );
+    let Ok(line) = serde_json::to_string(&request) else {
+        return false;
+    };
+    if stream.write_all(line.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+        return false;
+    }
+    let mut answer = String::new();
+    if BufReader::new(&stream).read_line(&mut answer).is_err() {
+        return false;
+    }
+    serde_json::from_str::<IpcResponse>(&answer).is_ok_and(|response| response.result.is_ok())
 }
 
 impl GpuiMcpServer {
@@ -1223,6 +1258,37 @@ fn tools_list() -> serde_json::Value {
                 }
             },
             {
+                "name": "launch_app",
+                "description": "Start the app with a command configured for this server (GPUI_MCP_LAUNCH: one command line, or a JSON object of named ones such as {\"run\": \"cargo xtask run\", \"hot\": \"cargo xtask hot\"}) and answer once a NEW instance answers on its socket — ready:true with its pid. Any running instance is stopped first. The build's output goes to a log file; if the command ends before the app answers, the answer is an error carrying the end of that log (the compiler's message). If the wait runs out, the answer is ready:false with the log's tail, and calling launch_app again goes on waiting for the same launch instead of starting another (restart:true forces a new one). Progress is reported while waiting when the client asks for it. Example: {\"profile\": \"hot\"}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "profile": {
+                            "type": "string",
+                            "description": "Which configured command to run. Needed when more than one is configured."
+                        },
+                        "restart": {
+                            "type": "boolean",
+                            "description": "Start anew even when a launch from this server is still under way. Default false."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "How long to wait for the app. Default 900000 (15 min, a first build), capped at 1800000."
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "stop_app",
+                "description": "Stop the app: every instance this server can see (asked to end, killed after 5 s), and the launch command it started with launch_app, with everything that command started. Example: {}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
                 "name": "reset_app",
                 "description": "Put the app back into a known starting state by calling the reset hook it registered (gpui_component::mcp::mcp_set_reset_hook). This is the half of determinism only the app can supply: pinning the window size makes layout reproducible, but nothing here can make an app left on the third tab with two files open behave like one that just started. Fails, loudly, when the app registered no hook — a replay that believes it started from a known state and did not is a green run hiding a bug. Example: {}",
                 "inputSchema": {
@@ -1430,6 +1496,7 @@ fn main() -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let reader = BufReader::new(stdin);
+    let mut launcher = launch::Launcher::default();
 
     for line in reader.lines() {
         let line = line?;
@@ -1516,6 +1583,57 @@ fn main() -> Result<()> {
                 // agent is most likely to be reading it.
                 if tool_name == docs::TOOL_NAME {
                     send_response(&mut stdout, &ok_response(id, guide_result(&arguments)))?;
+                    continue;
+                }
+
+                // Starting and stopping the app is the server's own work:
+                // there is no app to forward it to.
+                if tool_name == launch::LAUNCH_TOOL || tool_name == launch::STOP_TOOL {
+                    let token = params["_meta"]["progressToken"].clone();
+                    let outcome = if tool_name == launch::LAUNCH_TOOL {
+                        let mut count = 0u64;
+                        let mut progress = |message: &str| {
+                            if token.is_null() {
+                                return;
+                            }
+                            count += 1;
+                            let notification = json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/progress",
+                                "params": {
+                                    "progressToken": token,
+                                    "progress": count,
+                                    "message": message,
+                                },
+                            });
+                            if let Ok(line) = serde_json::to_string(&notification) {
+                                writeln!(stdout, "{line}").ok();
+                                stdout.flush().ok();
+                            }
+                        };
+                        launcher.launch(&arguments, &app_instances, &answers_at, &mut progress)
+                    } else {
+                        launcher.stop(&app_instances)
+                    };
+                    let response = match outcome {
+                        Ok(report) => ok_response(
+                            id,
+                            json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string_pretty(&report)?,
+                                }]
+                            }),
+                        ),
+                        Err(error) => ok_response(
+                            id,
+                            json!({
+                                "content": [{ "type": "text", "text": format!("Error: {error}") }],
+                                "isError": true,
+                            }),
+                        ),
+                    };
+                    send_response(&mut stdout, &response)?;
                     continue;
                 }
 
@@ -1711,10 +1829,15 @@ mod tests {
         assert_eq!(tools[0]["name"], docs::TOOL_NAME);
         assert_eq!(
             tools.len(),
-            methods::ALL.len() + 3,
-            "every IPC method plus the three the server answers itself"
+            methods::ALL.len() + 5,
+            "every IPC method plus the five the server answers itself"
         );
-        for local in [REPLAY_TOOL, GOLDEN_TOOL] {
+        for local in [
+            REPLAY_TOOL,
+            GOLDEN_TOOL,
+            launch::LAUNCH_TOOL,
+            launch::STOP_TOOL,
+        ] {
             assert!(
                 tools.iter().any(|tool| tool["name"] == local),
                 "{local} is not advertised"

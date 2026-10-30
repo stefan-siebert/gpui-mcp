@@ -85,7 +85,12 @@ pub const READ_ONLY: &[&str] = &[
 ];
 
 /// Tools that are the server's own and mean nothing to a replay.
-pub const NOT_RECORDED: &[&str] = &[crate::docs::TOOL_NAME, REPLAY_TOOL];
+pub const NOT_RECORDED: &[&str] = &[
+    crate::docs::TOOL_NAME,
+    REPLAY_TOOL,
+    crate::launch::LAUNCH_TOOL,
+    crate::launch::STOP_TOOL,
+];
 
 pub fn is_read_only(method: &str) -> bool {
     READ_ONLY.contains(&method)
