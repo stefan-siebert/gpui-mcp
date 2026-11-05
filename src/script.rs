@@ -14,10 +14,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::vars::{self, Vars};
+
 /// Name of the tool that replays a recorded script. Server-local, like the
 /// guide: it drives the app through the other tools rather than being one of
 /// them.
 pub const REPLAY_TOOL: &str = "replay_script";
+
+/// Start writing the session to a script from here on — what
+/// `GPUI_MCP_RECORD` does from the first call, for a session that only
+/// later knows it is making a test. Server-local and never recorded.
+pub const START_RECORDING_TOOL: &str = "start_recording";
+
+/// Stop the recording [`START_RECORDING_TOOL`] (or `GPUI_MCP_RECORD`) began.
+pub const STOP_RECORDING_TOOL: &str = "stop_recording";
 
 /// A recorded session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +98,8 @@ pub const READ_ONLY: &[&str] = &[
 pub const NOT_RECORDED: &[&str] = &[
     crate::docs::TOOL_NAME,
     REPLAY_TOOL,
+    START_RECORDING_TOOL,
+    STOP_RECORDING_TOOL,
     crate::launch::LAUNCH_TOOL,
     crate::launch::STOP_TOOL,
 ];
@@ -132,11 +144,31 @@ impl Script {
             .filter(|dir| !dir.as_os_str().is_empty())
     }
 
-    /// A step's params as the tool should see them. The one rewrite: a golden
-    /// path is relative to the script file, and the tool knows nothing about
-    /// scripts, so it is made relative to the working directory here.
-    fn params_for(&self, step: &Step) -> serde_json::Value {
-        let mut params = step.params.clone();
+    /// The variables the steps use (`${fixture}`) that `vars` has no value
+    /// for. A replay with any refuses to start: a step that clicked
+    /// `${fixture}/a.txt` literally would fail far from the reason.
+    pub fn missing_vars(&self, vars: &Vars) -> Vec<String> {
+        let mut missing: Vec<String> = Vec::new();
+        for step in &self.steps {
+            for name in vars::used(&step.params) {
+                if !vars.contains_key(&name) && !missing.contains(&name) {
+                    missing.push(name);
+                }
+            }
+        }
+        missing
+    }
+
+    /// A step's params as the tool should see them. Two rewrites: the
+    /// variables go in, and a golden path, which is relative to the script
+    /// file while the tool knows nothing about scripts, is made relative to
+    /// the working directory.
+    fn params_for(&self, step: &Step, vars: &Vars) -> serde_json::Value {
+        let mut params = if vars.is_empty() {
+            step.params.clone()
+        } else {
+            vars::substitute(&step.params, vars)
+        };
         if step.method != crate::golden::TOOL_NAME {
             return params;
         }
@@ -231,6 +263,9 @@ pub struct Recorder {
     /// `item` -> 62, every id in that snapshot and how many lines carried it.
     /// This is what catches an id a step names outright rather than by ref.
     id_counts: HashMap<String, usize>,
+    /// The values written down as `${name}`, longest first when applied —
+    /// see [`vars::abstract_values`].
+    vars: Vec<(String, String)>,
 }
 
 impl Recorder {
@@ -260,7 +295,16 @@ impl Recorder {
             refs: HashMap::new(),
             ambiguous: HashMap::new(),
             id_counts: HashMap::new(),
+            vars: Vec::new(),
         }
+    }
+
+    /// Write every occurrence of these values as `${name}` — a fixture's
+    /// path, so the script replays against the next run's fixture. Each
+    /// value's canonical spelling counts too.
+    pub fn with_vars(mut self, vars: &Vars) -> Self {
+        self.vars = vars::with_canonical_spellings(vars);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -315,6 +359,9 @@ impl Recorder {
         let (mut params, note) = self.resolve_refs(params.clone());
         if method == crate::golden::TOOL_NAME {
             self.anchor_golden_path(&mut params);
+        }
+        if !self.vars.is_empty() {
+            params = vars::abstract_values(&params, &self.vars);
         }
         self.script.steps.push(Step {
             method: method.to_string(),
@@ -446,9 +493,21 @@ impl Recorder {
     /// can still pick a different element to click, or go and name it.
     fn doubts_about(&self, id: &str) -> Option<String> {
         // A step may name an id in any of the forms the app resolves: `#save`,
-        // a bare `save`, or a whole dotted path ending in it. The snapshot
-        // counts last segments, so compare last segments.
-        let segment = id.trim_start_matches('#').rsplit('.').next()?;
+        // a bare `save`, a whole dotted path ending in it, or a scoped
+        // `panel-left >> save`. The snapshot counts what it prints — last
+        // segments, and a scope where one was needed — so compare that.
+        let parts = gpui_mcp_protocol::protocol::scoped_id_parts(id)?;
+        let last = parts.last()?.rsplit('.').next()?;
+        let printed = match parts.split_last() {
+            Some((_, [])) => last.to_string(),
+            Some((_, scopes)) => {
+                let mut printed = scopes.to_vec();
+                printed.push(last);
+                gpui_mcp_protocol::protocol::scoped_id(&printed)
+            }
+            None => return None,
+        };
+        let segment = printed.as_str();
 
         if let Some(count) = self.id_counts.get(segment).filter(|count| **count > 1) {
             return Some(format!(
@@ -458,9 +517,9 @@ impl Recorder {
             ));
         }
 
-        gpui_mcp_protocol::protocol::id_looks_generated(segment).then(|| {
+        gpui_mcp_protocol::protocol::id_looks_generated(last).then(|| {
             format!(
-                "#{segment} ends in a number the app generates fresh on every start, so it reads \
+                "#{last} ends in a number the app generates fresh on every start, so it reads \
                  like a name and is not one: this step will find nothing after a restart. Give \
                  that element an id of its own in the app."
             )
@@ -481,12 +540,13 @@ fn parse_snapshot_line(line: &str) -> Option<(&str, &str)> {
 
     // Look for the id only in front of the ref, and only accept something
     // shaped like one — a name can contain a `#` of its own, and reading
-    // `"Item #3"` as an id would record a selector that matches nothing.
+    // `"Item #3"` as an id would record a selector that matches nothing. A
+    // scoped id (`panel-left>>back`, printed where the bare one is not
+    // unique) is one when each of its parts is.
     let test_id = before_ref.rsplit_once(" #")?.1.split_whitespace().next()?;
-    let looks_like_an_id = !test_id.is_empty()
-        && test_id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    let looks_like_an_id = test_id
+        .split(gpui_mcp_protocol::protocol::SCOPE_SEPARATOR)
+        .all(gpui_mcp_protocol::protocol::is_test_id_segment);
 
     looks_like_an_id.then_some((reference, test_id))
 }
@@ -501,6 +561,9 @@ pub struct ReplayOptions {
     /// batch does: the steps after a failure are acting on a state nobody
     /// intended.
     pub stop_on_error: bool,
+    /// What `${name}` stands for in the steps. Every variable a step uses
+    /// needs a value, or the replay does not start.
+    pub vars: Vars,
 }
 
 impl Default for ReplayOptions {
@@ -510,6 +573,7 @@ impl Default for ReplayOptions {
         Self {
             seek: false,
             stop_on_error: true,
+            vars: Vars::new(),
         }
     }
 }
@@ -605,7 +669,7 @@ pub fn replay(
             continue;
         }
 
-        let outcome = match call(&step.method, script.params_for(step)) {
+        let outcome = match call(&step.method, script.params_for(step, &options.vars)) {
             Err(error) => Err(error.to_string()),
             Ok(value) => match unmet_expectation(&step.method, &value) {
                 Some(reason) => Err(reason),
@@ -753,6 +817,15 @@ fn unmet_expectation(method: &str, value: &serde_json::Value) -> Option<String> 
         ),
         // An audit step in a script is an assertion about the UI, the same way
         // a wait is an assertion about its state.
+        // An audit of nothing is not a pass; the app says why it checked
+        // nothing, and "0 serious and 0 warnings" would hide exactly that.
+        "a11y_audit" if value.get("checked") == Some(&serde_json::json!(0)) => Some(
+            value
+                .get("detail")
+                .and_then(|detail| detail.as_str())
+                .unwrap_or("the audit checked no element: the window painted nothing")
+                .to_string(),
+        ),
         "a11y_audit" if value.get("ok") == Some(&serde_json::json!(false)) => Some(format!(
             "{} serious and {} warnings, at fail_on={}",
             value.get("serious").unwrap_or(&serde_json::json!(0)),
@@ -799,6 +872,149 @@ mod tests {
         assert_eq!(parse_snapshot_line("- button \"Item #3\" @e4"), None);
         assert_eq!(parse_snapshot_line("ui_snapshot 1 — WindowId(1)"), None);
         assert_eq!(parse_snapshot_line(""), None);
+    }
+
+    /// Where a component is shown twice, the snapshot prints the scoped form
+    /// for its ids, and the recorder takes that as the name.
+    #[test]
+    fn a_scoped_id_on_a_snapshot_line_is_an_id() {
+        assert_eq!(
+            parse_snapshot_line("  - button \"Back\" #panel-left>>history-back @e9 ✓"),
+            Some(("e9", "panel-left>>history-back"))
+        );
+        assert_eq!(
+            parse_snapshot_line("- row \"a.txt\" #panel-right>>entry:a%2Etxt @e12"),
+            Some(("e12", "panel-right>>entry:a%2Etxt"))
+        );
+        assert_eq!(parse_snapshot_line("- button #panel-left>> @e3"), None);
+    }
+
+    #[test]
+    fn a_ref_to_a_scoped_id_records_the_scoped_id_without_a_doubt() {
+        let path = temp_path("scoped");
+        let mut recorder = Recorder::new(&path, None);
+        recorder
+            .record(
+                "ui_snapshot",
+                &json!({}),
+                Some(
+                    "- button #panel-left>>history-back @e1\n\
+                     - button #panel-right>>history-back @e2\n",
+                ),
+            )
+            .unwrap();
+        recorder
+            .record("click_element", &json!({ "element_id": "@e2" }), None)
+            .unwrap();
+        // Named outright, with the spaces a person types.
+        recorder
+            .record(
+                "click_element",
+                &json!({ "element_id": "panel-left >> history-back" }),
+                None,
+            )
+            .unwrap();
+
+        let written = Script::read(&path).unwrap();
+        assert_eq!(
+            written.steps[1].params["element_id"],
+            "panel-right>>history-back"
+        );
+        assert!(
+            written.steps[1].note.is_none(),
+            "{:?}",
+            written.steps[1].note
+        );
+        assert!(
+            written.steps[2].note.is_none(),
+            "{:?}",
+            written.steps[2].note
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A fixture's path is different on every run; a script that froze it
+    /// would replay against nothing the next day.
+    #[test]
+    fn a_recorded_fixture_path_becomes_its_variable() {
+        let path = temp_path("vars");
+        let fixture = std::env::temp_dir().join(format!("gpui-mcp-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let given = fixture.to_string_lossy().to_string();
+        let canonical = std::fs::canonicalize(&fixture)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let mut recorder = Recorder::new(&path, None).with_vars(
+            &[("fixture".to_string(), given.clone())]
+                .into_iter()
+                .collect(),
+        );
+        recorder
+            .record(
+                "type_text",
+                &json!({ "text": format!("{given}/a.txt") }),
+                None,
+            )
+            .unwrap();
+        recorder
+            .record(
+                "wait_for",
+                &json!({ "app_state_path": "/app/path", "app_state_equals": canonical }),
+                None,
+            )
+            .unwrap();
+
+        let written = Script::read(&path).unwrap();
+        assert_eq!(written.steps[0].params["text"], "${fixture}/a.txt");
+        assert_eq!(written.steps[1].params["app_state_equals"], "${fixture}");
+        assert_eq!(written.steps[1].params["app_state_path"], "/app/path");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&fixture).ok();
+    }
+
+    #[test]
+    fn a_replay_puts_the_variables_in() {
+        let script = script_of(&[
+            ("type_text", json!({ "text": "${fixture}/a.txt" })),
+            ("wait_for", json!({ "app_state_equals": "${fixture}" })),
+        ]);
+        let mut seen = Vec::new();
+        let report = replay(
+            &script,
+            &ReplayOptions {
+                vars: [("fixture".to_string(), "/tmp/run-7".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            |method, params| {
+                seen.push(params);
+                Ok(match method {
+                    "wait_for" => json!({ "satisfied": true }),
+                    _ => json!({ "success": true }),
+                })
+            },
+        );
+        assert!(report.ok);
+        assert_eq!(seen[0]["text"], "/tmp/run-7/a.txt");
+        assert_eq!(seen[1]["app_state_equals"], "/tmp/run-7");
+    }
+
+    #[test]
+    fn a_script_names_the_variables_it_was_not_given() {
+        let script = script_of(&[
+            ("type_text", json!({ "text": "${fixture}/${name}" })),
+            ("send_key", json!({ "key": "enter" })),
+        ]);
+        let given: Vars = [("name".to_string(), "x".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(script.missing_vars(&given), vec!["fixture".to_string()]);
+        assert!(script_of(&[("send_key", json!({ "key": "enter" }))])
+            .missing_vars(&Vars::new())
+            .is_empty());
     }
 
     /// The whole point of recording: `@e6` means "line six of what I am
@@ -946,6 +1162,7 @@ mod tests {
             &ReplayOptions {
                 seek: false,
                 stop_on_error: true,
+                ..Default::default()
             },
             |_, _| {
                 Ok(json!({
@@ -976,6 +1193,7 @@ mod tests {
             &ReplayOptions {
                 seek: false,
                 stop_on_error: false,
+                ..Default::default()
             },
             |method, _| {
                 Ok(match method {
@@ -1022,6 +1240,7 @@ mod tests {
             &ReplayOptions {
                 seek: true,
                 stop_on_error: true,
+                ..Default::default()
             },
             |method, _| {
                 called.push(method.to_string());
@@ -1058,6 +1277,21 @@ mod tests {
         let detail = report.steps[0].detail.as_deref().unwrap();
         assert!(detail.contains('3'), "{detail}");
         assert!(detail.contains('7'), "{detail}");
+    }
+
+    /// A window that painted nothing has nothing wrong with it, and an
+    /// audit gate that passed it would pass a display that was asleep.
+    #[test]
+    fn an_audit_of_nothing_fails_the_replay() {
+        let script = script_of(&[("a11y_audit", json!({}))]);
+        // An app from before the fix still says ok: true; the step fails
+        // anyway, on the count.
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Ok(json!({ "ok": true, "checked": 0, "serious": 0, "warnings": 0 }))
+        });
+        assert!(!report.ok);
+        let detail = report.steps[0].detail.as_deref().unwrap();
+        assert!(detail.contains("no element"), "{detail}");
     }
 
     #[test]

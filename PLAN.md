@@ -362,6 +362,38 @@ comparison catching it is the point.
 Still not built, and still worth having: recording input a *person* performs by
 hand — the server only sees what passes through it, so that needs the app side.
 
+### 3c — scripts a fixture can run — **done (2026-11-05)**
+
+Asked for by Elane's UI tests (its plan
+`docs/superpowers/plans/2026-11-04-ui-test-automation.md`, F7–F9), and generic:
+
+* **Variables.** `${name}` in any string of a step's params, filled from
+  `--var name=value` / `replay_script {"vars": …}`; a script whose variables
+  are not all given does not start. Recording with `GPUI_MCP_RECORD_VARS` or
+  `start_recording {"vars": …}` writes each value — and its canonical
+  spelling, `/private/var/…` for `/var/…` on macOS — as `${name}`. `$${`
+  escapes. Server-local; nothing on the wire changed.
+* **`start_recording` / `stop_recording`**, so a session can decide halfway
+  that the next part is a test, without restarting the server under
+  `GPUI_MCP_RECORD`. One recording at a time.
+* **Scoped ids**, `panel-left >> back`: the element whose id ends in the
+  segment `back` with `panel-left` among its ancestors. Resolved app-side
+  (gpui-component `id_matches`); the snapshot prints `#panel-left>>back`
+  wherever the bare id is repeated but a nearest distinguishing ancestor
+  settles every copy, so refs, recorded scripts and the audit all pick it up.
+  A group that no scope settles completely stays bare and is still reported.
+* **Test ids may carry more** — one word starting lowercase, anything but
+  whitespace, `"#@/[]>` and `::` — so a row can be named after its file
+  (`entry:read%2Eme`). Before, `:` and `%` dropped such an id from the
+  snapshot entirely.
+* **Two bugs from Elane's phase 0:** `"app_state_equals": null` read as "not
+  given" and could never match (now `deserialize_with` keeps the two apart,
+  no type change, so every evaluator is fixed by a rebuild); and an
+  `a11y_audit` that checked 0 elements — a display asleep — said `ok: true`.
+  It is `ok: false` with a `detail` now, a replay fails that step on the count
+  even against an older app, and a snapshot of a window that painted nothing
+  says so in its header.
+
 ### The original sketch, for the parts still not built
 
 Record **semantically**, never as coordinates: at record time each real user

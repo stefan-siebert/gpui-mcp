@@ -19,9 +19,12 @@ mod docs;
 mod golden;
 mod launch;
 mod script;
+mod vars;
 
 use golden::TOOL_NAME as GOLDEN_TOOL;
-use script::{Recorder, ReplayOptions, Report, Script, REPLAY_TOOL};
+use script::{
+    Recorder, ReplayOptions, Report, Script, REPLAY_TOOL, START_RECORDING_TOOL, STOP_RECORDING_TOOL,
+};
 
 /// MCP Server for GPUI inspection and automation.
 ///
@@ -473,6 +476,15 @@ fn snapshot_text(tool_name: &str, content: &serde_json::Value) -> Option<String>
             " (stopped early — raise max_elements, or narrow with filter / root_element_id)",
         );
     }
+    // An empty list reads like an empty window, and usually is not one: the
+    // display is asleep or the window has not drawn. Said here, because the
+    // next thing an agent would do with an empty snapshot is trust it.
+    if content["painted_elements"] == json!(0) {
+        header.push_str(
+            " — the window painted nothing. A display that is asleep, a hidden or minimised \
+             window, or a frame not drawn yet; nothing here says what the UI looks like",
+        );
+    }
 
     Some(format!("{header}\n{snapshot}"))
 }
@@ -489,6 +501,22 @@ fn replay_file(
     options: &ReplayOptions,
 ) -> Result<(Script, Report)> {
     let script = Script::read(path)?;
+    let missing = script.missing_vars(&options.vars);
+    if !missing.is_empty() {
+        let names: Vec<String> = missing.iter().map(|name| format!("${{{name}}}")).collect();
+        let example: Vec<String> = missing
+            .iter()
+            .map(|name| format!("--var {name}=…"))
+            .collect();
+        anyhow::bail!(
+            "{} uses {} and was given no value for it. Pass it ({} on the command line, \
+             \"vars\": {{\"{}\": \"…\"}} to {REPLAY_TOOL}); nothing was replayed.",
+            path.display(),
+            names.join(", "),
+            example.join(" "),
+            missing[0],
+        );
+    }
     let report = script::replay(&script, options, |method, params| {
         server
             .handle_tool_call(method, params)
@@ -516,6 +544,7 @@ fn replay_result(
             .get("stop_on_error")
             .and_then(|stop| stop.as_bool())
             .unwrap_or(true),
+        vars: vars::from_arguments(arguments)?,
     };
 
     let (script, report) = replay_file(server, std::path::Path::new(path), &options)?;
@@ -526,6 +555,58 @@ fn replay_result(
         object.insert("path".into(), json!(path));
     }
     Ok(result)
+}
+
+/// Answer [`START_RECORDING_TOOL`]: from the next call on, the session is a
+/// script. One recording at a time — a second start would leave the first
+/// file to say less than its session did, so it is refused instead.
+fn start_recording(
+    recorder: &mut Option<Recorder>,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    if let Some(current) = recorder {
+        anyhow::bail!(
+            "already recording to {} ({} steps so far); {STOP_RECORDING_TOOL} first",
+            current.path().display(),
+            current.steps()
+        );
+    }
+    let path = arguments
+        .get("path")
+        .and_then(|path| path.as_str())
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("{START_RECORDING_TOOL} needs a `path` for the script file")
+        })?;
+    let record_vars = vars::from_arguments(arguments)?;
+    let started =
+        Recorder::new(path.trim(), std::env::var("GPUI_MCP_APP").ok()).with_vars(&record_vars);
+    let path = started.path().display().to_string();
+    eprintln!("[MCP] Recording this session to {path}");
+    *recorder = Some(started);
+    Ok(json!({
+        "recording": true,
+        "path": path,
+        "vars": record_vars.keys().collect::<Vec<_>>(),
+    }))
+}
+
+/// Answer [`STOP_RECORDING_TOOL`]. The file is already complete — the
+/// recorder rewrites it after every step — so stopping only stops adding.
+fn stop_recording(recorder: &mut Option<Recorder>) -> Result<serde_json::Value> {
+    let stopped = recorder
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("nothing is being recorded"))?;
+    eprintln!(
+        "[MCP] Recorded {} steps to {}",
+        stopped.steps(),
+        stopped.path().display()
+    );
+    Ok(json!({
+        "recording": false,
+        "path": stopped.path().display().to_string(),
+        "steps": stopped.steps(),
+    }))
 }
 
 /// The content size of the window a recording is happening against.
@@ -772,9 +853,42 @@ fn tools_list() -> serde_json::Value {
                         "stop_on_error": {
                             "type": "boolean",
                             "description": "Stop at the first failing step. Default: true — the steps after a failure act on a state nobody intended."
+                        },
+                        "vars": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" },
+                            "description": "What ${name} stands for in the steps, e.g. {\"fixture\": \"/tmp/run-7\"}. A script whose variables are not all given does not start."
                         }
                     },
                     "required": ["path"]
+                }
+            },
+            {
+                "name": START_RECORDING_TOOL,
+                "description": "Write this session to a script file from the next call on — what GPUI_MCP_RECORD does from the start, for a session that only later knows it is making a test. Every successful call is appended and the file is valid JSON after each one; refs are rewritten to ids where the snapshot printed one. vars writes each value as ${name}, so a fixture's path becomes ${fixture} and the script replays against the next run's fixture. One recording at a time. Example: {\"path\": \"tests/mkdir.json\", \"vars\": {\"fixture\": \"/tmp/run-7\"}}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Script file to write (created or replaced), relative to the server's working directory."
+                        },
+                        "vars": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" },
+                            "description": "Values to write as ${name}: {\"fixture\": \"/tmp/run-7\"}. A path's canonical spelling counts too."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": STOP_RECORDING_TOOL,
+                "description": "Stop the recording start_recording (or GPUI_MCP_RECORD) began. The file is already complete; this answers with its path and step count. Example: {}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }
             },
             {
@@ -1346,6 +1460,10 @@ gpui-mcp-server — an MCP server for inspecting and driving a running GPUI app.
       --seek                            skip the read-only steps: reach the
                                         state, do not test the way there
       --keep-going                      do not stop at the first failure
+      --var name=value                  what ${name} stands for in the steps
+                                        (repeatable); a script whose
+                                        variables are not all given does not
+                                        start
   gpui-mcp-server --help
 
 Environment:
@@ -1354,6 +1472,9 @@ Environment:
   GPUI_MCP_SOCKET_DIR      look for app sockets here instead of the temp
                            directory (a sandboxed app's container tmp/)
   GPUI_MCP_RECORD          write every successful tool call to this script file
+  GPUI_MCP_RECORD_VARS     name=value;name=value: write each value as ${name}
+                           while recording (a fixture's path, so the script
+                           replays against the next run's)
   GPUI_MCP_UPDATE_GOLDENS  1: rewrite golden images instead of failing against them
 ";
 
@@ -1379,15 +1500,20 @@ fn run_command(arguments: &[String]) -> Result<()> {
 
 fn run_replay(arguments: &[String]) -> Result<()> {
     let mut path: Option<&str> = None;
-    let mut options = ReplayOptions {
-        seek: false,
-        stop_on_error: true,
-    };
+    let mut options = ReplayOptions::default();
 
-    for argument in arguments {
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--seek" => options.seek = true,
             "--keep-going" => options.stop_on_error = false,
+            "--var" => {
+                let assignment = arguments
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--var needs name=value"))?;
+                let (name, value) = vars::parse_assignment(assignment)?;
+                options.vars.insert(name, value);
+            }
             other if other.starts_with('-') => {
                 anyhow::bail!("Unknown option for replay: {other}");
             }
@@ -1483,7 +1609,12 @@ fn main() -> Result<()> {
     // the seek script that gets the next session there in one call.
     let mut recorder = match std::env::var("GPUI_MCP_RECORD") {
         Ok(path) if !path.trim().is_empty() => {
-            let recorder = Recorder::new(path.trim(), std::env::var("GPUI_MCP_APP").ok());
+            let record_vars = match std::env::var("GPUI_MCP_RECORD_VARS") {
+                Ok(list) => vars::parse_list(&list).context("GPUI_MCP_RECORD_VARS")?,
+                Err(_) => vars::Vars::new(),
+            };
+            let recorder = Recorder::new(path.trim(), std::env::var("GPUI_MCP_APP").ok())
+                .with_vars(&record_vars);
             eprintln!(
                 "[MCP] Recording this session to {}",
                 recorder.path().display()
@@ -1614,6 +1745,36 @@ fn main() -> Result<()> {
                         launcher.launch(&arguments, &app_instances, &answers_at, &mut progress)
                     } else {
                         launcher.stop(&app_instances)
+                    };
+                    let response = match outcome {
+                        Ok(report) => ok_response(
+                            id,
+                            json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string_pretty(&report)?,
+                                }]
+                            }),
+                        ),
+                        Err(error) => ok_response(
+                            id,
+                            json!({
+                                "content": [{ "type": "text", "text": format!("Error: {error}") }],
+                                "isError": true,
+                            }),
+                        ),
+                    };
+                    send_response(&mut stdout, &response)?;
+                    continue;
+                }
+
+                // Recording is the server's own state: a script is written
+                // here, and the app never hears of it.
+                if tool_name == START_RECORDING_TOOL || tool_name == STOP_RECORDING_TOOL {
+                    let outcome = if tool_name == START_RECORDING_TOOL {
+                        start_recording(&mut recorder, &arguments)
+                    } else {
+                        stop_recording(&mut recorder)
                     };
                     let response = match outcome {
                         Ok(report) => ok_response(
@@ -1821,6 +1982,23 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_empty_snapshot_says_the_window_painted_nothing() {
+        let empty = json!({
+            "snapshot_id": 3, "window_id": "WindowId(1)", "elements": 0,
+            "painted_elements": 0, "truncated": false, "snapshot": "",
+        });
+        let text = snapshot_text(methods::UI_SNAPSHOT, &empty).unwrap();
+        assert!(text.contains("painted nothing"), "{text}");
+
+        let painted = json!({
+            "snapshot_id": 4, "window_id": "WindowId(1)", "elements": 1,
+            "painted_elements": 9, "truncated": false, "snapshot": "- button @e1\n",
+        });
+        let text = snapshot_text(methods::UI_SNAPSHOT, &painted).unwrap();
+        assert!(!text.contains("painted nothing"), "{text}");
+    }
+
     /// The guide only helps if it is the first thing an agent sees.
     #[test]
     fn the_guide_is_advertised_first() {
@@ -1829,11 +2007,13 @@ mod tests {
         assert_eq!(tools[0]["name"], docs::TOOL_NAME);
         assert_eq!(
             tools.len(),
-            methods::ALL.len() + 5,
-            "every IPC method plus the five the server answers itself"
+            methods::ALL.len() + 7,
+            "every IPC method plus the seven the server answers itself"
         );
         for local in [
             REPLAY_TOOL,
+            START_RECORDING_TOOL,
+            STOP_RECORDING_TOOL,
             GOLDEN_TOOL,
             launch::LAUNCH_TOOL,
             launch::STOP_TOOL,
@@ -1970,6 +2150,8 @@ mod tests {
         assert!(!methods::ALL.contains(&docs::TOOL_NAME));
         assert!(!methods::ALL.contains(&REPLAY_TOOL));
         assert!(!methods::ALL.contains(&GOLDEN_TOOL));
+        assert!(!methods::ALL.contains(&START_RECORDING_TOOL));
+        assert!(!methods::ALL.contains(&STOP_RECORDING_TOOL));
     }
 
     /// A replay that recorded itself would grow without end.
@@ -1977,10 +2159,42 @@ mod tests {
     fn the_server_local_tools_are_never_recorded() {
         assert!(script::NOT_RECORDED.contains(&docs::TOOL_NAME));
         assert!(script::NOT_RECORDED.contains(&REPLAY_TOOL));
+        assert!(script::NOT_RECORDED.contains(&START_RECORDING_TOOL));
+        assert!(script::NOT_RECORDED.contains(&STOP_RECORDING_TOOL));
         assert!(
             !script::NOT_RECORDED.contains(&GOLDEN_TOOL),
             "a golden check is an assertion the session made; it belongs in the script"
         );
+    }
+
+    #[test]
+    fn a_recording_starts_once_and_stops_once() {
+        let path = std::env::temp_dir().join(format!(
+            "gpui-mcp-start-recording-{}.json",
+            std::process::id()
+        ));
+        let mut recorder = None;
+        let started = start_recording(
+            &mut recorder,
+            &json!({ "path": path.to_string_lossy(), "vars": { "fixture": "/tmp/x" } }),
+        )
+        .unwrap();
+        assert_eq!(started["recording"], true);
+        assert_eq!(started["vars"], json!(["fixture"]));
+
+        let again = start_recording(&mut recorder, &json!({ "path": "other.json" }))
+            .expect_err("one recording at a time");
+        assert!(again.to_string().contains("already recording"), "{again}");
+
+        let stopped = stop_recording(&mut recorder).unwrap();
+        assert_eq!(stopped["steps"], 0);
+        assert!(recorder.is_none());
+        assert!(stop_recording(&mut recorder).is_err());
+        assert!(
+            start_recording(&mut recorder, &json!({})).is_err(),
+            "needs a path"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// A hand-written script can name them; the answer has to say why that

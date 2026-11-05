@@ -296,7 +296,8 @@ given holds at once. Conditions: `element_id` (an element is painted), `text`
 chain), `app_state_path` + optional `app_state_equals` or
 `app_state_not_equals` (a JSON pointer into `get_app_state`; `not_equals`
 takes the value read *before* the action, so a change that landed before the
-wait began still counts). `absent: true` inverts the lot — that is how you wait for a
+wait began still counts; `null` is a value to compare with, so
+`"app_state_equals": null` waits for a slot to empty). `absent: true` inverts the lot — that is how you wait for a
 dialog to close. `timeout_ms` defaults to 3000 and is capped at 30000.
 Running out of time is not an error: the answer says `satisfied: false` and
 `checks` names the part that was missing.
@@ -416,8 +417,18 @@ app is running.
 Replay a recorded session. `seek: true` skips the read-only steps and just
 puts the app back where the work was; the default runs everything as a test,
 where a `wait_for` that comes back unsatisfied is a failed assertion. Recording
-is switched on by starting the server with `GPUI_MCP_RECORD=<path>`. See the
+is switched on by starting the server with `GPUI_MCP_RECORD=<path>`, or
+mid-session with `start_recording`. `vars` gives `${name}` in the steps a
+value: `{"path": "t.json", "vars": {"fixture": "/tmp/run-7"}}`. See the
 `recording` topic.
+
+**`start_recording`** — `{"path": "tests/mkdir.json", "vars": {"fixture": "/tmp/run-7"}}`
+Write the session to a script from the next call on. `vars` writes each value
+as `${name}`, so a fixture's path is not frozen into the file. One recording
+at a time.
+
+**`stop_recording`** — `{}`
+Stop it. The file is complete after every step; this only stops adding.
 "#;
 
 const RECIPES: &str = r#"# Recipes
@@ -613,7 +624,7 @@ describes an older frame.
 
 const IDS: &str = r#"# Element ids and element types
 
-## The four forms
+## The five forms
 
 Every tool that takes an element id accepts any of:
 
@@ -623,6 +634,16 @@ Every tool that takes an element id accepts any of:
 | full | `WindowId(1)/view-1.panel[0]` | exactly what `inspect_ui_tree` returned — never ambiguous |
 | global | `view-1.panel` | stable across window ids |
 | suffix | `panel` | shortest; **the first match wins**, so check there is only one |
+| scoped | `panel-left >> back` | the `back` inside `panel-left` — for a component shown twice |
+
+A **scoped** id names an element by an ancestor: `panel-left >> back` is the
+element whose id ends in the segment `back` and that has `panel-left` above
+it, at any depth. Scopes chain (`window >> panel-left >> back`), outermost
+first; spaces around `>>` are optional. Unlike a bare suffix, each part is
+compared as whole segments. Where a bare id appears more than once but each
+copy has an ancestor the others lack, `ui_snapshot` prints the scoped form —
+`#panel-left>>back` — so a ref and a recorded script both get a name that
+holds, and `a11y_audit` does not report those copies as duplicates.
 
 A `@ref` is shorthand for "the thing on that line of the snapshot I just
 showed you". Each snapshot replaces the previous set, so a ref from an older
@@ -661,7 +682,14 @@ that it does not exist yet because the frame you are looking at predates it.
 Ids are the app's to give. Elements you intend to target from here should get
 an explicit, unique id in the app's source: `div().id("results")`. Unique
 means unique within the window — the suffix form takes the first match, and
-two elements ending in `.row` make that a coin flip.
+two elements ending in `.row` make that a coin flip. A component the window
+shows twice does not need every id inside it renamed: give each copy's root
+an id (`panel-left`, `panel-right`) and the ids inside are scoped by it.
+
+An id segment is one word starting with a lowercase letter; inside it,
+anything but whitespace, `"`, `#`, `@`, `/`, `[`, `]` and `>` — so
+`entry:read%2Eme` is an id, and an app naming a row after its file
+percent-encodes the rest (and the `.`, which gpui uses to join segments).
 "#;
 
 const FOCUS: &str = r#"# Focus, key contexts and actions
@@ -755,6 +783,28 @@ GPUI_MCP_RECORD=tests/open-file.json
 Every successful tool call is appended. Failed calls are not: a script of
 things that did not work replays nothing. The file is rewritten after each
 step, so an interrupted session still leaves valid JSON behind.
+
+Or start mid-session, once you know this part is the test:
+
+```json
+{"name": "start_recording", "arguments": {"path": "tests/mkdir.json", "vars": {"fixture": "/tmp/run-7"}}}
+{"name": "stop_recording", "arguments": {}}
+```
+
+## Variables
+
+A test usually runs against a directory made fresh for the run, whose path
+is different every time. `vars` on `start_recording` (or
+`GPUI_MCP_RECORD_VARS=fixture=/tmp/run-7;other=/x`) writes every occurrence
+of each value as `${fixture}` — its canonical spelling too, `/private/tmp/…`
+on macOS — and a replay gets the values back:
+
+```json
+{"name": "replay_script", "arguments": {"path": "tests/mkdir.json", "vars": {"fixture": "/tmp/run-8"}}}
+```
+
+On the command line: `--var fixture=/tmp/run-8`. A script that uses a
+variable it was not given does not start. A literal `${` is written `$${`.
 
 You do not do anything special while recording. Drive the app as usual.
 
@@ -953,6 +1003,8 @@ mod tests {
         let server_local = [
             TOOL_NAME,
             crate::script::REPLAY_TOOL,
+            crate::script::START_RECORDING_TOOL,
+            crate::script::STOP_RECORDING_TOOL,
             crate::golden::TOOL_NAME,
         ];
         for tool in methods::ALL.iter().chain(server_local.iter()) {

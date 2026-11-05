@@ -159,6 +159,7 @@ Windows `%APPDATA%\Claude\`):
 | `GPUI_MCP_SOCKET_DIR` | look for sockets in this directory only, instead of the defaults. Combines with both rows above |
 | neither | the newest GPUI app found; a warning on stderr when there is more than one |
 | `GPUI_MCP_RECORD` | additionally: write every successful tool call to this script file — see [Recording and replay](#recording-and-replay) |
+| `GPUI_MCP_RECORD_VARS` | with `GPUI_MCP_RECORD`: `name=value;name=value` — write each value as `${name}` in the script, so a fixture's path is not frozen into it. See [Variables](#variables) |
 | `GPUI_MCP_UPDATE_GOLDENS` | `1` (or `true`) accepts what the window looks like now instead of failing against the stored golden — a decision for a whole run, after looking at what changed. Any other value, `false` included, leaves comparison on |
 
 Discovery scans the OS temp directory and, on macOS, `~/Library/Caches/gpui-mcp/` (or only `GPUI_MCP_SOCKET_DIR`) for `gpui-mcp-*.sock`, probes each, and
@@ -182,11 +183,13 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `send_key` | one keystroke in gpui's notation (`enter`, `pagedown`, `f5`; modifiers as flags); `repeat: {count, interval_ms, delay_ms}` holds it |
 | `type_text` | a string, one keystroke per character |
 | `click_element` | left/right/middle click at an element's centre or at window pixel coordinates |
-| `wait_for` | wait inside the app, one check per painted frame, until an element, a text, a key context or an app-state value is there — or, with `absent`, gone |
+| `wait_for` | wait inside the app, one check per painted frame, until an element, a text, a key context or an app-state value is there — or, with `absent`, gone. `"app_state_equals": null` waits for the value `null`; leaving the field out means "any value" |
 | `batch` | several tools in one call, in order, with one state snapshot at the end — the way to spend one turn instead of four |
 | `take_screenshot` | the window (or one element, cropped) rendered to PNG, downscaled to 1400px wide unless `max_width` says otherwise |
 | `get_logs` | the in-app log buffer (≤500 lines) |
-| `replay_script` | replay a recorded session — to reach a state (`seek`), or as a test |
+| `replay_script` | replay a recorded session — to reach a state (`seek`), or as a test; `vars` fills in `${name}` |
+| `start_recording` | write the session to a script from the next call on; `vars` writes values as `${name}`. Server-local |
+| `stop_recording` | stop it; the file is already complete. Server-local |
 | `set_viewport` | resize a window to an exact content size, and answer after the frame that shows it. Recorded scripts carry a viewport and replay applies it first |
 | `reset_app` | put the app back into a known starting state via the hook it registered. Fails loudly when there is none |
 | `expect_screenshot` | compare the window against a stored golden image. Answered by the server, so the goldens live beside the script |
@@ -204,10 +207,15 @@ What this cannot cover is work the app starts on its own: an async load, a
 debounce, an animation. That is what `wait_for` is for, and it waits inside the
 app rather than costing the agent a call per look.
 
-**Element ids** come in four forms, all accepted wherever an id is taken: a
+**Element ids** come in five forms, all accepted wherever an id is taken: a
 `@ref` from the last `ui_snapshot`, the full id
-(`WindowId(1)/view-1.panel[0]`), the global id (`view-1.panel`), or a suffix
-(`panel`) — the first match wins. An id copied out of `format: "compact"`
+(`WindowId(1)/view-1.panel[0]`), the global id (`view-1.panel`), a suffix
+(`panel`) — the first match wins — or a scoped id, `panel-left >> back`: the
+`back` that has `panel-left` among its ancestors, compared by whole segments.
+A scope is how to name the ids inside a component the window shows twice
+without renaming each one after its copy; where a bare id is not unique but
+a scoped one is, the snapshot prints the scoped form (`#panel-left>>back`) and
+the audit does not count it as a duplicate. An id copied out of `format: "compact"`
 output works too, shortened crate paths and instance suffix and all, as does
 the `#panel` the snapshot prints. Give the elements you want to target stable
 ids in the app (`div().id("results")`): a lowercase, dashed id is what the
@@ -282,10 +290,14 @@ problems it can actually see:
 | check | severity | what it means |
 |---|---|---|
 | `unnamed-control` | serious | an interactive element that paints no text. A screen reader has nothing to announce, and nothing can target it by name |
-| `duplicate-id` | serious on a control, else warning | one id names several elements. A suffix match takes the first, so a click or a recorded script may act on the wrong one |
+| `duplicate-id` | serious on a control, else warning | one id names several elements and no scope tells them apart. A suffix match takes the first, so a click or a recorded script may act on the wrong one. Copies that a scope does tell apart (`panel-left >> back`) are not reported |
 | `target-too-small` | warning | an interactive element with a side under `min_target_size`, 24px by default (WCAG 2.2) |
 | `zero-size-control` | serious | an interactive element painted with no area at all |
 | `unstable-id` | warning | an id ending in a number the app generates fresh on every start, like `#input-4294967299`. It reads like a name and is not one: anything written down against it matches nothing after a restart |
+
+An audit that checked no element at all — a display that is asleep, a window
+not drawn yet — is `ok: false` with a `detail` saying so. It found nothing
+wrong because it saw nothing, and a gate that passed it would pass anything.
 
 A first run against a real desktop UI — the gpui-component gallery, an
 unmodified upstream demo used here as a test subject — reported nine unnamed
@@ -406,6 +418,28 @@ generated number (`#input-4294967299`). The audit reports both of these too,
 but it reports them about the app, later, if anyone runs it. The note reports
 them about *this step*, while the person recording it can still pick a
 different element or go and name that one.
+
+A recording can also start mid-session: `start_recording {"path": …}` writes
+from the next call on, `stop_recording` ends it. Neither is meant for an
+allowlist — they write a file.
+
+### Variables
+
+A test that runs against a directory made fresh for each run cannot carry
+that directory's path. Record with `vars` (or `GPUI_MCP_RECORD_VARS`) and
+every occurrence of a value is written as `${name}` — its canonical spelling
+too, since an app on macOS reports `/private/var/…` for a temp directory made
+as `/var/…`:
+
+```sh
+GPUI_MCP_RECORD=tests/mkdir.json GPUI_MCP_RECORD_VARS="fixture=$FIXTURE" …
+gpui-mcp-server replay tests/mkdir.json --var fixture="$NEXT_FIXTURE"
+```
+
+`replay_script` takes the same as `"vars": {"fixture": "…"}`. Values go into
+every string of every step's params. A script that uses a variable it was not
+given does not start — a step that typed `${fixture}/a.txt` literally would
+fail somewhere far from the reason. A literal `${` is written `$${`.
 
 Replaying the file does two different jobs:
 

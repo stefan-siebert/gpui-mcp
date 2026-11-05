@@ -654,14 +654,31 @@ pub struct WaitForParams {
     #[serde(default)]
     pub app_state_path: Option<String>,
     /// The value [`Self::app_state_path`] must reach.
-    #[serde(default)]
+    ///
+    /// `null` is a value here, not "not given": `"app_state_equals": null`
+    /// waits for the pointer to resolve to `null` — a dialog that closed, a
+    /// selection that emptied. Leaving the field out is what "not given"
+    /// means. (Plain serde reads both as `None`, which made "wait until it is
+    /// null" impossible to say; [`explicit_null`] keeps them apart.)
+    #[serde(
+        default,
+        deserialize_with = "explicit_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub app_state_equals: Option<serde_json::Value>,
     /// The value [`Self::app_state_path`] must move away from — the one read
     /// before the action whose effect is awaited. Unlike "wait for a change
     /// from the start of this wait", it cannot miss a change that landed
     /// between the action and the wait. E.g. after an edit under hot
     /// reloading: `/gpui/hot_reload/patches_received` ≠ the count before.
-    #[serde(default)]
+    ///
+    /// `null` is a value here too: `"app_state_not_equals": null` waits for
+    /// something to appear where `null` was.
+    #[serde(
+        default,
+        deserialize_with = "explicit_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub app_state_not_equals: Option<serde_json::Value>,
     /// Invert the whole predicate: wait until the conditions stop holding.
     /// This is how you wait for a dialog to close or a spinner to go away.
@@ -715,6 +732,19 @@ fn default_true() -> bool {
     true
 }
 
+/// Read a field whose `null` means the value `null`.
+///
+/// With `#[serde(default)]` a missing field never reaches this, so it stays
+/// `None`; a field that is there — `null` included — becomes `Some`. Plain
+/// `Option<Value>` folds the two together, and for a comparison value that is
+/// the difference between "compare with null" and "do not compare".
+fn explicit_null<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 /// Most steps a single [`methods::BATCH`] may carry.
 pub const MAX_BATCH_STEPS: usize = 32;
 
@@ -748,9 +778,135 @@ pub fn id_looks_generated(test_id: &str) -> bool {
         >= GENERATED_ID_DIGITS
 }
 
+/// What separates a scope from the id inside it: `panel-left >> back` is the
+/// `back` that lies inside `panel-left`.
+///
+/// A window that shows one component twice — two file panels, two editors —
+/// gives every id inside it twice, and a suffix match always takes the first.
+/// Renaming each id after its copy (`back-left`) would make every component
+/// know how often it is shown; naming the copy's root and scoping by it does
+/// not. Scopes chain (`a >> b >> c`), each an ancestor of the next, not
+/// necessarily the parent.
+pub const SCOPE_SEPARATOR: &str = ">>";
+
+/// The parts of a scoped id, outermost first, each trimmed and without a
+/// leading `#`: `"#panel-left >> back"` → `["panel-left", "back"]`. An id
+/// without a scope is one part. `None` when a part is empty
+/// (`"panel-left >>"`), which names nothing and should be said so.
+pub fn scoped_id_parts(query: &str) -> Option<Vec<&str>> {
+    query
+        .split(SCOPE_SEPARATOR)
+        .map(|part| {
+            let part = part.trim();
+            let part = part.strip_prefix('#').unwrap_or(part);
+            (!part.is_empty()).then_some(part)
+        })
+        .collect()
+}
+
+/// A scoped id in the one spelling a snapshot prints and a recorder writes:
+/// no spaces around the separator, so it stays a single word on a snapshot
+/// line. `["panel-left", "back"]` → `panel-left>>back`.
+pub fn scoped_id(parts: &[&str]) -> String {
+    parts.join(SCOPE_SEPARATOR)
+}
+
+/// Whether one segment of a global element id is an id somebody wrote — the
+/// test id a snapshot prints — rather than gpui's scaffolding.
+///
+/// Scaffolding is a view's `view-N`, a type name (`FilePanel`, starting in
+/// upper case) and a type path (`gpui_component::input::Input`, which starts
+/// lower case and is rejected by its `::`). What is left starts with a
+/// lowercase letter and is one word: no whitespace, nothing a snapshot line
+/// uses for its own syntax (`"`, `#`, `@`), nothing an element id uses for
+/// its decoration (`/` before the path, `[` before the instance), and no
+/// `>`, which scopes. Inside that, anything goes — `entry:read%2Eme`, a name
+/// in another script — because an id that names a file has to be able to
+/// carry its name.
+pub fn is_test_id_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_lowercase()
+        && !segment.starts_with("view-")
+        && !segment.contains("::")
+        && segment
+            .chars()
+            .all(|c| !c.is_whitespace() && !c.is_control() && !"\"#@/[]>".contains(c))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scoped_id_splits_into_its_parts() {
+        assert_eq!(scoped_id_parts("back"), Some(vec!["back"]));
+        assert_eq!(
+            scoped_id_parts("#panel-left >> #back"),
+            Some(vec!["panel-left", "back"])
+        );
+        assert_eq!(
+            scoped_id_parts("window>>panel-left>>back"),
+            Some(vec!["window", "panel-left", "back"])
+        );
+        assert_eq!(scoped_id_parts("panel-left >>"), None);
+        assert_eq!(scoped_id_parts(">> back"), None);
+        assert_eq!(scoped_id(&["panel-left", "back"]), "panel-left>>back");
+    }
+
+    #[test]
+    fn a_test_id_segment_is_one_word_somebody_wrote() {
+        for written in [
+            "save",
+            "col-header-3",
+            "entry:read%2Eme",
+            "entry:übersicht",
+            "a_b",
+        ] {
+            assert!(is_test_id_segment(written), "{written}");
+        }
+        for scaffolding in [
+            "",
+            "view-12",
+            "FilePanel",
+            "gpui_component::input::Input",
+            "has space",
+            "say\"hi\"",
+            "a#b",
+            "a@b",
+            "a[0]",
+            "a>b",
+            "3d",
+        ] {
+            assert!(!is_test_id_segment(scaffolding), "{scaffolding}");
+        }
+    }
+
+    /// `null` is the value a dialog's slot takes when it closes; waiting for
+    /// it has to be expressible, and it has to stay apart from "not given".
+    #[test]
+    fn an_explicit_null_is_a_value_to_wait_for() {
+        let null: WaitForParams = serde_json::from_str(
+            r#"{"app_state_path":"/app/modal","app_state_equals":null,"app_state_not_equals":null}"#,
+        )
+        .unwrap();
+        assert_eq!(null.app_state_equals, Some(serde_json::Value::Null));
+        assert_eq!(null.app_state_not_equals, Some(serde_json::Value::Null));
+
+        let missing: WaitForParams =
+            serde_json::from_str(r#"{"app_state_path":"/app/modal"}"#).unwrap();
+        assert_eq!(missing.app_state_equals, None);
+        assert_eq!(missing.app_state_not_equals, None);
+
+        // And it survives the trip back, so a batch step carries it on.
+        let again: WaitForParams =
+            serde_json::from_value(serde_json::to_value(&null).unwrap()).unwrap();
+        assert_eq!(again.app_state_equals, Some(serde_json::Value::Null));
+        let missing = serde_json::to_value(&missing).unwrap();
+        assert!(missing.get("app_state_equals").is_none());
+    }
 
     #[test]
     fn click_event_defaults() {

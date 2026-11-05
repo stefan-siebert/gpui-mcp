@@ -94,6 +94,9 @@ cargo fmt --check                           # CI gate
 - `GPUI_MCP_APP` — app name passed to `init_mcp`; restricts discovery.
 - `GPUI_MCP_PID` — with `GPUI_MCP_APP`: exact socket, no discovery.
 - `GPUI_MCP_RECORD` — write every successful tool call to this script file.
+  `start_recording`/`stop_recording` do the same mid-session.
+- `GPUI_MCP_RECORD_VARS` — `name=value;…`: written as `${name}` while
+  recording; a replay takes them back with `--var name=value` / `vars`.
 - `GPUI_MCP_UPDATE_GOLDENS` — `1` rewrites goldens instead of failing against
   them. Deliberately not a step parameter: a script that could update its own
   golden would never fail.
