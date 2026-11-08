@@ -790,6 +790,50 @@ fn passing_note(method: &str, value: &serde_json::Value) -> Option<String> {
     )
 }
 
+/// The findings a failed audit returned, one per line, worst first as the
+/// app sorts them. A report that says only "1 serious" on a machine nobody
+/// can log into (a CI runner) leaves nothing to fix; the finding itself
+/// names the check, the element and why.
+fn listed_findings(value: &serde_json::Value) -> String {
+    const SHOWN: usize = 10;
+    let Some(findings) = value.get("findings").and_then(|f| f.as_array()) else {
+        return String::new();
+    };
+    let text = |finding: &serde_json::Value, key: &str| {
+        finding
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut lines: Vec<String> = findings
+        .iter()
+        .take(SHOWN)
+        .map(|finding| {
+            let mut line = format!(
+                "\n    {} {}: {}",
+                text(finding, "severity"),
+                text(finding, "check"),
+                text(finding, "message")
+            );
+            let id = text(finding, "test_id");
+            let element = if id.is_empty() {
+                text(finding, "element")
+            } else {
+                id
+            };
+            if !element.is_empty() {
+                line.push_str(&format!(" [{element}]"));
+            }
+            line
+        })
+        .collect();
+    if findings.len() > SHOWN {
+        lines.push(format!("\n    … {} more", findings.len() - SHOWN));
+    }
+    lines.concat()
+}
+
 /// A step that succeeded as a call but did not say what the script expects.
 fn unmet_expectation(method: &str, value: &serde_json::Value) -> Option<String> {
     match method {
@@ -827,12 +871,13 @@ fn unmet_expectation(method: &str, value: &serde_json::Value) -> Option<String> 
                 .to_string(),
         ),
         "a11y_audit" if value.get("ok") == Some(&serde_json::json!(false)) => Some(format!(
-            "{} serious and {} warnings, at fail_on={}",
+            "{} serious and {} warnings, at fail_on={}{}",
             value.get("serious").unwrap_or(&serde_json::json!(0)),
             value.get("warnings").unwrap_or(&serde_json::json!(0)),
             value
                 .get("fail_on")
-                .unwrap_or(&serde_json::json!("serious"))
+                .unwrap_or(&serde_json::json!("serious")),
+            listed_findings(value)
         )),
         _ => None,
     }
@@ -1277,6 +1322,26 @@ mod tests {
         let detail = report.steps[0].detail.as_deref().unwrap();
         assert!(detail.contains('3'), "{detail}");
         assert!(detail.contains('7'), "{detail}");
+    }
+
+    /// What failed is in the report, not only how many: a CI runner's log
+    /// is all there is to look at.
+    #[test]
+    fn a_failing_audit_names_its_findings() {
+        let script = script_of(&[("a11y_audit", json!({}))]);
+        let report = replay(&script, &ReplayOptions::default(), |_, _| {
+            Ok(json!({
+                "ok": false, "serious": 1, "warnings": 0, "fail_on": "serious",
+                "findings": [{
+                    "severity": "serious", "check": "duplicate-id",
+                    "message": "2 elements share this id", "element": "x", "test_id": "panel-left"
+                }]
+            }))
+        });
+        let detail = report.steps[0].detail.as_deref().unwrap();
+        assert!(detail.contains("duplicate-id"), "{detail}");
+        assert!(detail.contains("2 elements share this id"), "{detail}");
+        assert!(detail.contains("panel-left"), "{detail}");
     }
 
     /// A window that painted nothing has nothing wrong with it, and an
