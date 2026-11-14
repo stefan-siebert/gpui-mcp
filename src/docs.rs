@@ -199,7 +199,12 @@ moving windows. No text selection except through the app's own keys.
 const TOOLS: &str = r#"# Every tool, with a minimal call
 
 Inputs marked optional may be omitted entirely. Anything taking `window_id`
-defaults to the active window.
+defaults to the active window. A `window_id` is the id `get_windows` prints,
+or `with:<element id>` — the window showing that element (any id form below).
+Scripts use the second: they cannot know a `WindowId` in advance, and while
+the app runs in the background no window is active, so a child window never
+becomes the default. A `wait_for` on a `with:` window that is not open yet
+waits for it to open.
 
 ## Inspection
 

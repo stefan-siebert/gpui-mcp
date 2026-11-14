@@ -908,7 +908,7 @@ fn tools_list() -> serde_json::Value {
                     "properties": {
                         "window_id": {
                             "type": "string",
-                            "description": "Window to snapshot (default: active window)"
+                            "description": "Window to snapshot (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         },
                         "root_element_id": {
                             "type": "string",
@@ -942,7 +942,7 @@ fn tools_list() -> serde_json::Value {
                     "properties": {
                         "window_id": {
                             "type": "string",
-                            "description": "Window to audit (default: active window)"
+                            "description": "Window to audit (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         },
                         "root_element_id": {
                             "type": "string",
@@ -973,7 +973,7 @@ fn tools_list() -> serde_json::Value {
                     "properties": {
                         "window_id": {
                             "type": "string",
-                            "description": "Window to read (default: active window)"
+                            "description": "Window to read (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         }
                     },
                     "required": []
@@ -1036,7 +1036,7 @@ fn tools_list() -> serde_json::Value {
                     "properties": {
                         "window_id": {
                             "type": "string",
-                            "description": "Window to check focus for (default: active window)"
+                            "description": "Window to check focus for (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         }
                     },
                     "required": []
@@ -1062,7 +1062,7 @@ fn tools_list() -> serde_json::Value {
                         },
                         "window_id": {
                             "type": "string",
-                            "description": "Window to evaluate only_available against (default: active window)"
+                            "description": "Window to evaluate only_available against (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         }
                     },
                     "required": []
@@ -1084,7 +1084,7 @@ fn tools_list() -> serde_json::Value {
                         },
                         "window_id": {
                             "type": "string",
-                            "description": "Target window (default: active window)"
+                            "description": "Target window (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         }
                     },
                     "required": ["action"]
@@ -1111,7 +1111,7 @@ fn tools_list() -> serde_json::Value {
                         },
                         "window_id": {
                             "type": "string",
-                            "description": "Target window (default: active window)"
+                            "description": "Target window (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         },
                         "repeat": {
                             "type": "object",
@@ -1146,7 +1146,7 @@ fn tools_list() -> serde_json::Value {
                         },
                         "window_id": {
                             "type": "string",
-                            "description": "Target window (default: active window)"
+                            "description": "Target window (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         }
                     },
                     "required": []
@@ -1180,7 +1180,7 @@ fn tools_list() -> serde_json::Value {
                                 "meta": { "type": "boolean", "description": "Super/Cmd modifier" }
                             }
                         },
-                        "window_id": { "type": "string", "description": "Target window (default: active window)" }
+                        "window_id": { "type": "string", "description": "Target window (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)" }
                     },
                     "required": []
                 }
@@ -1205,7 +1205,7 @@ fn tools_list() -> serde_json::Value {
                                 "meta": { "type": "boolean", "description": "Super/Cmd modifier" }
                             }
                         },
-                        "window_id": { "type": "string", "description": "Target window (default: active window)" }
+                        "window_id": { "type": "string", "description": "Target window (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)" }
                     },
                     "required": []
                 }
@@ -1222,7 +1222,7 @@ fn tools_list() -> serde_json::Value {
                         },
                         "window_id": {
                             "type": "string",
-                            "description": "Target window (default: active window)"
+                            "description": "Target window (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         }
                     },
                     "required": ["text"]
@@ -1266,7 +1266,7 @@ fn tools_list() -> serde_json::Value {
                         },
                         "window_id": {
                             "type": "string",
-                            "description": "Window to watch (default: active window)"
+                            "description": "Window to watch (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         }
                     },
                     "required": []
@@ -1317,7 +1317,7 @@ fn tools_list() -> serde_json::Value {
                     "properties": {
                         "window_id": {
                             "type": "string",
-                            "description": "Window to screenshot (default: active window)"
+                            "description": "Window to screenshot (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         },
                         "element_id": {
                             "type": "string",
@@ -1365,7 +1365,7 @@ fn tools_list() -> serde_json::Value {
                         },
                         "window_id": {
                             "type": "string",
-                            "description": "Window to resize (default: active window)"
+                            "description": "Window to resize (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         }
                     },
                     "required": ["width", "height"]
@@ -1431,7 +1431,7 @@ fn tools_list() -> serde_json::Value {
                         },
                         "window_id": {
                             "type": "string",
-                            "description": "Window to compare (default: active window)"
+                            "description": "Window to compare (a get_windows id, or with:ELEMENT_ID for the window showing that element; default: active window)"
                         },
                         "channel_tolerance": {
                             "type": "integer",
