@@ -1153,6 +1153,32 @@ fn tools_list() -> serde_json::Value {
                 }
             },
             {
+                "name": "hover",
+                "description": "Move the mouse over an element or a point, no button down, and optionally leave it there. This is how hover colours, hover-only controls and tooltips are reached: nothing else moves the mouse without pressing it. hold_ms keeps it there before answering, so what the app shows only after a delay is in the frame the answer describes — a tooltip needs about 600. Follow it with wait_for {text} to read a tooltip as state, or take_screenshot to see it. The mouse stays where it was put until the next mouse tool moves it. Example: {\"element_id\": \"save-button\", \"hold_ms\": 600}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "element_id": { "type": "string", "description": "Hover over this element: the middle of its painted part. Supports full_id, global_id, suffix match, or a @ref." },
+                        "x": { "type": "number", "description": "Window X, when element_id is not given." },
+                        "y": { "type": "number", "description": "Window Y, when element_id is not given." },
+                        "offset_x": { "type": "number", "description": "This far right of the element's left edge instead of its middle." },
+                        "offset_y": { "type": "number", "description": "This far below the element's top edge instead of its middle." },
+                        "hold_ms": { "type": "integer", "description": "Stay this long before answering. Default 0, at most 10000." },
+                        "modifiers": {
+                            "type": "object",
+                            "properties": {
+                                "ctrl": { "type": "boolean", "description": "Control modifier" },
+                                "alt": { "type": "boolean", "description": "Alt modifier" },
+                                "shift": { "type": "boolean", "description": "Shift modifier" },
+                                "meta": { "type": "boolean", "description": "Super/Cmd modifier" }
+                            }
+                        },
+                        "window_id": { "type": "string", "description": "Target window (default: active window)" }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "drag",
                 "description": "Press the mouse, move it in steps, release it: drag a handle, resize by a grip, select text. Each step is painted before the next, so an app that reacts to the press by rendering a drag layer sees the moves. START: element_id (its centre, or offset_x/offset_y from its top left corner) or x/y. END: to_element_id, or to_x/to_y, or dx/dy from the start; with no end the mouse is pressed and released in place, which with click_count 2 is a double click. The answer carries selected_text when the window has a text selection afterwards, and selected_text_before_release for what was marked while the button was still down. Example: {\"element_id\": \"dialog-header\", \"dx\": 120, \"dy\": 40}",
                 "inputSchema": {
@@ -1311,7 +1337,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "take_screenshot",
-                "description": "Take a screenshot of a window or a specific element. Renders the current window content to a PNG image. Optionally crop to a specific element by ID for a focused, higher-detail view. Example: {\"element_id\": \"sidebar\"}",
+                "description": "Take a screenshot of a window or a specific element. Renders the current window content to a PNG image. Optionally crop to a specific element by ID for a focused, higher-detail view; padding widens that crop for what is painted outside the element — a tooltip, a menu, a focus ring. Example: {\"element_id\": \"sidebar\"}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1322,6 +1348,10 @@ fn tools_list() -> serde_json::Value {
                         "element_id": {
                             "type": "string",
                             "description": "Crop screenshot to this element's bounds. Supports full_id, global_id, or suffix match from inspect_ui_tree."
+                        },
+                        "padding": {
+                            "type": "number",
+                            "description": "With element_id: widen the crop by this many window pixels on every side, as far as the window reaches. A tooltip or a menu is painted outside the element it belongs to, and a crop to the element cuts it off."
                         },
                         "max_width": {
                             "type": "integer",

@@ -66,9 +66,10 @@ MCP client ──stdio JSON-RPC──▶ gpui-mcp-server ──Unix socket, NDJS
   exists — and a row in the tool table of gpui-component's `docs/docs/mcp.md`
   (plus its `zh-CN` mirror, which that repo requires).
 - Docs and code comments in English.
-- `wait_for`, `batch`, `a11y_tree` and `set_viewport` are answered
-  asynchronously by the app (it waits for frames); every other method is
-  answered from the frame already painted. Input methods (`click_element`,
+- `wait_for`, `batch`, `a11y_tree`, `set_viewport`, `drag` and `hover` are
+  answered asynchronously by the app (it waits for frames, `hover` also for
+  its `hold_ms`); every other method is answered from the frame already
+  painted. Input methods (`click_element`, `hover`, `drag`, `scroll`,
   `send_key`, `type_text`, `execute_action`, `reset_app`) answer only after the
   frame showing their effect, with `app_state` and `focus_info` from that frame
   appended — that is protocol v2, and it is why the version was bumped despite

@@ -183,9 +183,12 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `send_key` | one keystroke in gpui's notation (`enter`, `pagedown`, `f5`; modifiers as flags); `repeat: {count, interval_ms, delay_ms}` holds it |
 | `type_text` | a string, one keystroke per character |
 | `click_element` | left/right/middle click at an element's centre or at window pixel coordinates |
+| `hover` | move the mouse over an element or a point with no button down, and with `hold_ms` leave it there before answering — hover colours, hover-only controls, tooltips |
+| `drag` | press, move in steps (one frame each), release: move by a handle, resize by a grip, select text; `click_count: 2` in place is a double click |
+| `scroll` | one mouse-wheel event over an element or a point |
 | `wait_for` | wait inside the app, one check per painted frame, until an element, a text, a key context or an app-state value is there — or, with `absent`, gone. `"app_state_equals": null` waits for the value `null`; leaving the field out means "any value" |
 | `batch` | several tools in one call, in order, with one state snapshot at the end — the way to spend one turn instead of four |
-| `take_screenshot` | the window (or one element, cropped) rendered to PNG, downscaled to 1400px wide unless `max_width` says otherwise |
+| `take_screenshot` | the window (or one element, cropped; `padding` widens the crop for a tooltip or a menu painted outside it) rendered to PNG, downscaled to 1400px wide unless `max_width` says otherwise |
 | `get_logs` | the in-app log buffer (≤500 lines) |
 | `replay_script` | replay a recorded session — to reach a state (`seek`), or as a test; `vars` fills in `${name}` |
 | `start_recording` | write the session to a script from the next call on; `vars` writes values as `${name}`. Server-local |
@@ -194,8 +197,8 @@ deletes the ones nothing listens on (left behind by a crashed app).
 | `reset_app` | put the app back into a known starting state via the hook it registered. Fails loudly when there is none |
 | `expect_screenshot` | compare the window against a stored golden image. Answered by the server, so the goldens live beside the script |
 
-Every input tool (`send_key`, `type_text`, `click_element`, `execute_action`,
-and `reset_app`, which is input by another name) waits for the frame that shows
+Every input tool (`send_key`, `type_text`, `click_element`, `hover`, `drag`,
+`scroll`, `execute_action`, and `reset_app`, which is input by another name) waits for the frame that shows
 what it changed, then appends the app state and focus info from *that* frame,
 so the answer describes the app after the input rather than the app it
 replaced. `set_viewport` waits for that frame too, and answers with the size

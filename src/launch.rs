@@ -576,7 +576,9 @@ mod tests {
     }
 
     /// `GPUI_MCP_LAUNCH` set for as long as the guard lives; tests that set
-    /// it take turns.
+    /// it take turns. Those tests start a stand-in with `sh`, so they and this
+    /// are Unix only.
+    #[cfg(unix)]
     fn profiles_set(value: &str) -> impl Drop {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         struct Guard {

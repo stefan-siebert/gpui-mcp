@@ -265,6 +265,38 @@ pub struct DragEvent {
     pub window_id: Option<String>,
 }
 
+/// Params for [`methods::HOVER`]: move the mouse somewhere, no button down,
+/// and optionally leave it there.
+///
+/// The target is `element_id` (the middle of its painted part, or
+/// `offset_x`/`offset_y` from its top left corner) or `x`/`y`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HoverEvent {
+    #[serde(default)]
+    pub element_id: Option<String>,
+    #[serde(default)]
+    pub x: f32,
+    #[serde(default)]
+    pub y: f32,
+    #[serde(default)]
+    pub offset_x: Option<f32>,
+    #[serde(default)]
+    pub offset_y: Option<f32>,
+    /// Keep the mouse there this long before answering, so that what the app
+    /// shows only after a delay — a tooltip, a hover card — is in the frame
+    /// the answer describes. Omitted or zero: answer on the frame showing
+    /// the hover itself.
+    #[serde(default)]
+    pub hold_ms: Option<u64>,
+    #[serde(default)]
+    pub modifiers: Modifiers,
+    #[serde(default)]
+    pub window_id: Option<String>,
+}
+
+/// Longest [`HoverEvent::hold_ms`] the app honours.
+pub const MAX_HOVER_HOLD_MS: u64 = 10_000;
+
 /// Params for [`methods::SCROLL`]: one wheel event over `element_id` (its
 /// centre) or at `x`/`y`. `dy` is in pixels and positive towards the end of
 /// the content, the way a wheel turned down scrolls; `dx` likewise to the
@@ -365,6 +397,7 @@ pub mod methods {
     pub const WAIT_FOR: &str = "wait_for";
     pub const BATCH: &str = "batch";
     pub const CLICK_ELEMENT: &str = "click_element";
+    pub const HOVER: &str = "hover";
     pub const DRAG: &str = "drag";
     pub const SCROLL: &str = "scroll";
     pub const SEND_KEY: &str = "send_key";
@@ -393,6 +426,7 @@ pub mod methods {
         EXECUTE_ACTION,
         SEND_KEY,
         CLICK_ELEMENT,
+        HOVER,
         DRAG,
         SCROLL,
         TYPE_TEXT,
@@ -430,6 +464,12 @@ pub struct TakeScreenshotParams {
     /// and keeping every pixel is the thing you ask for.
     #[serde(default)]
     pub max_width: Option<u32>,
+    /// With [`Self::element_id`]: widen the crop by this many logical pixels
+    /// on every side, as far as the window reaches. What belongs to an
+    /// element is not all painted inside it — a tooltip, a menu, a focus
+    /// ring, a badge on its corner.
+    #[serde(default)]
+    pub padding: Option<f32>,
 }
 
 /// Widest image [`methods::TAKE_SCREENSHOT`] returns unless asked otherwise.

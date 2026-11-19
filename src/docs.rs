@@ -192,8 +192,11 @@ semantic role.
 
 ## What you cannot do
 
-No mouse movement, hover, drag or scroll wheel — only clicks. No resizing or
-moving windows. No text selection except through the app's own keys.
+No moving a window, and no resizing it other than `set_viewport`. No native
+dialogs, menus or drag sources the operating system draws: every tool here
+hands its events to GPUI, and what the platform paints itself never sees them.
+The mouse is synthetic for the same reason — the real pointer does not move,
+and a real one that does move over the window takes the hover back.
 "#;
 
 const TOOLS: &str = r#"# Every tool, with a minimal call
@@ -345,6 +348,15 @@ the answer's `dispatched` count tells you how many arrived.
 Clicks the centre of the element, or the given window coordinates. Optional
 `button: "Left" | "Right" | "Middle"`.
 
+**`hover`** — `{"element_id": "save-button", "hold_ms": 600}`
+Moves the mouse there with no button down: the middle of the element's
+painted part, `offset_x`/`offset_y` from its top left corner, or `x`/`y`.
+The only way to a hover colour, a control that exists only under the mouse,
+or a tooltip. `hold_ms` (default 0, at most 10000) keeps it there before
+answering — a tooltip appears after about half a second, so 600 has it in the
+answer's frame. The mouse stays put afterwards, so a screenshot or a
+`wait_for` in the next step still sees the hover. Optional `modifiers`.
+
 **`drag`** — `{"element_id": "dialog-header", "dx": 120, "dy": 40}`
 Presses the mouse, moves it in `steps` (default 8), releases it. Every step is
 painted before the next one is sent — an app that answers the press by
@@ -364,7 +376,7 @@ One mouse-wheel event over the centre of the element, or at `x`/`y`. `dy` is
 in pixels and positive towards the end of the content, the way a wheel turned
 down scrolls; `dx` likewise to the right.
 
-All six driving tools append `app_state` and `focus_info` to their answer —
+All seven driving tools append `app_state` and `focus_info` to their answer —
 see the staleness note in the `overview` topic.
 
 ## State
@@ -456,6 +468,25 @@ calls belongs in one `batch`:
 One turn instead of five, and the screenshot comes back attached to the same
 answer. Steps stop at the first failure, so a batch that reports `ok: true` did
 the whole thing.
+
+## Read a tooltip
+
+A tooltip is painted text like any other, so it is read as state rather than
+off an image — once the mouse is there and has stayed long enough:
+
+```json
+{"name": "batch", "arguments": {"steps": [
+  {"method": "hover",    "params": {"element_id": "save-button", "hold_ms": 600}},
+  {"method": "wait_for", "params": {"text": "Save the file"}},
+  {"method": "take_screenshot", "params": {"element_id": "save-button", "padding": 80}}
+]}}
+```
+
+`wait_for` answers whether the text is there; the screenshot is only for how
+it looks, and needs `padding` because a tooltip is painted outside the element
+it belongs to. To check that an element has *no* tooltip, hover with `hold_ms`
+and look — there is no text to wait for. Do not press a button to get the
+mouse somewhere (`drag` does): the press is an input of its own.
 
 ## Start the app, or start it again
 
@@ -751,6 +782,10 @@ you rarely need. Two levers:
 ```
 
 Cropping to an element is the better one — it answers a specific question.
+What belongs to an element is not all painted inside it, though: a tooltip, an
+open menu, a focus ring, a badge on a corner. `"padding": 80` widens the crop
+by that many window pixels on every side instead of going back to the whole
+window.
 Beyond that, every image is downscaled to 1400px wide by default; `max_width`
 changes that and `max_width: 0` turns it off when you genuinely need to read
 fine detail. A scaled answer says `scale`, and coordinates measured off such an
